@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ pub fn defaults() -> Value {
         "www_dir": "",
         "web_server": "apache",
         "ssl": true,
+        "lan_access": false,
         "start_all_on_launch": false,
         "run_on_startup": false,
         "minimize_to_tray": true,
@@ -63,13 +65,30 @@ pub struct JsonStore {
     path: PathBuf,
     defaults: Value,
     data: Mutex<Value>,
+    /// (modified time, length) of the file when it was last loaded or saved.
+    seen: Mutex<Option<(SystemTime, u64)>>,
 }
 
 impl JsonStore {
     pub fn open(path: PathBuf, defaults: Value) -> Result<Self> {
-        let s = JsonStore { path, defaults, data: Mutex::new(Value::Null) };
+        let s = JsonStore { path, defaults, data: Mutex::new(Value::Null), seen: Mutex::new(None) };
         s.load()?;
         Ok(s)
+    }
+
+    fn stamp(&self) -> Option<(SystemTime, u64)> {
+        let m = fs::metadata(&self.path).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    }
+
+    /// Reload if another process (the CLI, a text editor) changed the file since we last
+    /// read or wrote it. Keeps the GUI from showing stale values or overwriting them.
+    pub fn refresh(&self) {
+        let now = self.stamp();
+        let changed = *self.seen.lock().unwrap_or_else(|e| e.into_inner()) != now;
+        if changed && now.is_some() {
+            let _ = self.load();
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -94,6 +113,7 @@ impl JsonStore {
             }
         }
         *self.lock() = merged;
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = self.stamp();
         Ok(())
     }
 
@@ -105,6 +125,7 @@ impl JsonStore {
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, text)?;
         fs::rename(&tmp, &self.path)?;
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = self.stamp();
         Ok(())
     }
 
@@ -141,8 +162,11 @@ impl JsonStore {
         v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(default)
     }
 
+    /// A port from settings; an invalid value (0, > 65535, not a number) falls back to the default.
     pub fn port(&self, key: &str) -> u16 {
-        self.u64(&format!("ports.{key}"), 0) as u16
+        let default = self.defaults.pointer(&format!("/ports/{key}")).and_then(Value::as_u64).unwrap_or(0);
+        let valid = |n: u64| u16::try_from(n).ok().filter(|p| *p != 0);
+        valid(self.u64(&format!("ports.{key}"), default)).or_else(|| valid(default)).unwrap_or(0)
     }
 
     /// Set a value without saving (call save() afterwards).
@@ -159,7 +183,9 @@ impl JsonStore {
         cur[parts[parts.len() - 1]] = value;
     }
 
+    /// Set and save. Picks up outside changes first so they aren't overwritten.
     pub fn set(&self, dotted: &str, value: Value) -> Result<()> {
+        self.refresh();
         self.put(dotted, value);
         self.save()
     }

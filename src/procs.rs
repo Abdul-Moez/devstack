@@ -22,6 +22,27 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// One process list shared by every liveness check. Taking a snapshot lists every process on
+/// the machine, and the GUI checks a dozen PIDs every refresh, so snapshots are reused for
+/// a short time. Spawning or killing clears it so those changes are seen immediately.
+static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
+const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+
+fn invalidate_snapshot() {
+    *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn with_snapshot<R>(f: impl FnOnce(&System) -> R) -> R {
+    let mut guard = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = guard.as_ref().is_some_and(|(at, _)| at.elapsed() < SNAPSHOT_TTL);
+    if !fresh {
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        *guard = Some((Instant::now(), sys));
+    }
+    f(&guard.as_ref().expect("snapshot was just taken").1)
+}
+
 fn reap() {
     let mut kids = CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
     kids.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -88,22 +109,16 @@ pub fn spawn(args: &[String], cwd: &Path, env: Option<&HashMap<String, String>>,
     Ok(rec)
 }
 
-fn system_for(pid: u32) -> System {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, ProcessRefreshKind::nothing());
-    sys
-}
-
+/// Track a process that was just started (always looks at a fresh process list).
 pub fn record(pid: u32) -> ProcRec {
-    let sys = system_for(pid);
-    let ctime = sys.process(Pid::from_u32(pid)).map(|p| p.start_time()).unwrap_or(0);
+    invalidate_snapshot();
+    let ctime = with_snapshot(|sys| sys.process(Pid::from_u32(pid)).map(sysinfo::Process::start_time)).unwrap_or(0);
     ProcRec { pid, ctime, ..Default::default() }
 }
 
 pub fn alive(rec: &ProcRec) -> bool {
     reap();
-    let sys = system_for(rec.pid);
-    match sys.process(Pid::from_u32(rec.pid)) {
+    with_snapshot(|sys| match sys.process(Pid::from_u32(rec.pid)) {
         Some(p) => {
             if rec.ctime != 0 && p.start_time().abs_diff(rec.ctime) > 2 {
                 return false; // PID was reused by another program
@@ -111,7 +126,7 @@ pub fn alive(rec: &ProcRec) -> bool {
             !matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)
         }
         None => false,
-    }
+    })
 }
 
 /// Terminate a process and all its children.
@@ -122,8 +137,11 @@ pub fn kill_tree(pid: u32, timeout: Duration) {
     let mut i = 0;
     while i < tree.len() {
         let parent = tree[i];
+        // A child can't be older than its parent. An older process pointing at this PID is
+        // an orphan of whatever program used the PID before, so leave it alone.
+        let born = sys.process(parent).map_or(0, sysinfo::Process::start_time);
         for (cpid, p) in sys.processes() {
-            if p.parent() == Some(parent) && !tree.contains(cpid) {
+            if p.parent() == Some(parent) && p.start_time() >= born && !tree.contains(cpid) {
                 tree.push(*cpid);
             }
         }
@@ -143,16 +161,23 @@ pub fn kill_tree(pid: u32, timeout: Duration) {
             }
         }
     }
-    let recs: Vec<ProcRec> = tree.iter().map(|p| ProcRec { pid: p.as_u32(), ..Default::default() }).collect();
+    invalidate_snapshot();
+    // Remember start times so a PID reused while we wait isn't mistaken for our process.
+    let recs: Vec<ProcRec> = tree
+        .iter()
+        .map(|p| ProcRec { pid: p.as_u32(), ctime: sys.process(*p).map_or(0, sysinfo::Process::start_time), ..Default::default() })
+        .collect();
     if !wait_exit(&recs, timeout) {
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-        for p in &tree {
-            if let Some(proc_) = sys.process(*p) {
+        for r in &recs {
+            if let Some(proc_) = sys.process(Pid::from_u32(r.pid)).filter(|p| r.ctime == 0 || p.start_time().abs_diff(r.ctime) <= 2) {
                 proc_.kill();
             }
         }
+        invalidate_snapshot();
         wait_exit(&recs, Duration::from_secs(3));
     }
+    invalidate_snapshot();
     reap();
 }
 
@@ -189,8 +214,7 @@ pub fn listening() -> HashMap<u16, u32> {
 }
 
 pub fn process_name(pid: u32) -> Option<String> {
-    let sys = system_for(pid);
-    sys.process(Pid::from_u32(pid)).map(|p| p.name().to_string_lossy().into_owned())
+    with_snapshot(|sys| sys.process(Pid::from_u32(pid)).map(|p| p.name().to_string_lossy().into_owned()))
 }
 
 /// Who is listening on `port`, or None if it's free.

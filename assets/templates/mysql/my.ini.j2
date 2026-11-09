@@ -4,6 +4,9 @@ basedir = "{{ mysql_dir }}"
 datadir = "{{ mysql_data }}"
 port = {{ mysql_port }}
 bind-address = 127.0.0.1
+# MySQL 8+ also opens the X Protocol port (33060) on every interface; keep it local too.
+# "loose-" makes MariaDB, which has no such option, ignore the line.
+loose-mysqlx-bind-address = 127.0.0.1
 character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
 max_allowed_packet = 256M

@@ -106,7 +106,8 @@ impl<'a> MySqlTools<'a> {
         files.sort();
         for f in files {
             let stem = f.file_stem().unwrap().to_string_lossy().into_owned();
-            let c = self.client(&["mysql", "mariadb"], vec!["-e".into(), format!("source {}", fwd(&f))])?;
+            // Quoted: the client's `source` stops at the first space otherwise (C:/Users/Some Name/...).
+            let c = self.client(&["mysql", "mariadb"], vec!["-e".into(), format!("source \"{}\"", fwd(&f))])?;
             let r = run(c, Duration::from_secs(3600))?;
             log(&if r.ok() { format!("Restored {stem}") } else { format!("Restore of {stem} failed: {}", r.message()) });
         }

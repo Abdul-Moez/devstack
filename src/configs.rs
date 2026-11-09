@@ -138,6 +138,9 @@ pub fn context(app: &App, sites: &[Site]) -> Result<Value> {
         "tmp": fwd(&p.tmp), "data": fwd(&p.data), "usr": fwd(&p.usr), "ssl_dir": fwd(&p.ssl),
         "dashboard_dir": fwd(p.etc.join("dashboard")),
         "ports": s.get("ports"),
+        // Web servers listen on 127.0.0.1 only, unless the user lets other devices in.
+        // Listening everywhere would let anyone on the same Wi-Fi browse www/ (incl. .env files).
+        "bind": if s.bool("lan_access") { "" } else { "127.0.0.1:" },
         "ssl": s.bool("ssl"),
         "localhost_cert": fwd(p.ssl.join("sites").join("localhost.crt")),
         "localhost_key": fwd(p.ssl.join("sites").join("localhost.key")),

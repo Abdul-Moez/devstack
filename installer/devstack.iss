@@ -23,8 +23,9 @@ AppVersion={#AppVersion}
 AppPublisher=devstack
 DefaultDirName={sd}\devstack
 DisableProgramGroupPage=yes
+; Always a per-user install: devstack must never run elevated, and its folder must stay
+; writable by the user (an elevated "all users" install would break both).
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\dist
 OutputBaseFilename=devstack-setup-{#AppVersion}
 SetupIconFile=..\assets\devstack.ico
@@ -87,7 +88,7 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{app}\ds.exe"; Parameters: "setup --pause-on-error --packages {code:SetupPackages}"; StatusMsg: "Downloading the selected tools (this can take a few minutes)..."; Check: HasPackages; Flags: waituntilterminated
 Filename: "{app}\ds.exe"; Parameters: "path add"; Tasks: addpath; Flags: runhidden waituntilterminated
 Filename: "{app}\ds.exe"; Parameters: "autostart on"; Tasks: autostart; Flags: runhidden waituntilterminated
-Filename: "{app}\devstack.exe"; Description: "Open devstack now"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\devstack.exe"; Description: "Open devstack now"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallRun]
 Filename: "{app}\ds.exe"; Parameters: "stop --force"; Flags: runhidden waituntilterminated; RunOnceId: "StopServices"
@@ -189,6 +190,16 @@ begin
   Result := PackageList <> '';
 end;
 
+{ Only what devstack itself creates next to the exe. Never DelTree the whole folder: it may
+  have been installed into a folder that also holds other files. }
+procedure DeleteDevstackItem(Path: String);
+begin
+  if DirExists(Path) then
+    DelTree(Path, True, True, True)
+  else if FileExists(Path) then
+    DeleteFile(Path);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   App: String;
@@ -198,10 +209,22 @@ begin
     App := ExpandConstant('{app}');
     if DirExists(App + '\www') or DirExists(App + '\data') or DirExists(App + '\bin') then
     begin
-      if MsgBox('Also delete everything devstack created in ' + App + '?' + #13#10 + #13#10 +
-                'This includes your projects (www), databases (data), backups and downloaded tools.' + #13#10 +
-                'Choose No to keep them.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-        DelTree(App, True, True, True);
+      if MsgBox('Also delete devstack''s folders in ' + App + '?' + #13#10 + #13#10 +
+                'This deletes your projects (www), databases (data), backups and downloaded tools ' +
+                '(bin, etc, logs, tmp, usr, backup, settings.json). Other files in the folder are kept.' + #13#10 +
+                'Choose No to keep everything.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
+        DeleteDevstackItem(App + '\bin');
+        DeleteDevstackItem(App + '\etc');
+        DeleteDevstackItem(App + '\data');
+        DeleteDevstackItem(App + '\logs');
+        DeleteDevstackItem(App + '\tmp');
+        DeleteDevstackItem(App + '\usr');
+        DeleteDevstackItem(App + '\backup');
+        DeleteDevstackItem(App + '\www');
+        DeleteDevstackItem(App + '\settings.json');
+        RemoveDir(App); { only succeeds if nothing else is left }
+      end;
     end;
   end;
 end;

@@ -19,11 +19,12 @@ pub const IS_WIN: bool = cfg!(windows);
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// "mysqld" -> "mysqld.exe" on Windows, unchanged elsewhere (lets the core run on Linux for tests).
+/// Names that already have an extension ("index.php", "composer.phar", "Code.exe") stay as they are.
 pub fn exe(name: &str) -> String {
-    let lower = name.to_lowercase();
-    if IS_WIN && !(lower.ends_with(".exe") || lower.ends_with(".bat") || lower.ends_with(".cmd")) {
+    let has_ext = Path::new(name).extension().is_some();
+    if IS_WIN && !has_ext {
         format!("{name}.exe")
-    } else if !IS_WIN && lower.ends_with(".exe") {
+    } else if !IS_WIN && name.to_lowercase().ends_with(".exe") {
         name[..name.len() - 4].to_string()
     } else {
         name.to_string()
@@ -245,10 +246,22 @@ pub fn valid_name(name: &str) -> bool {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$").unwrap()).is_match(name)
 }
 
-/// Environment for a child process: current env plus overrides.
+/// A single file or folder name that is safe to join onto a path: no separators, no `..`.
+/// Used for names that come from download sources (version strings, asset names).
+pub fn safe_file_name(name: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,119}$").unwrap()).is_match(name) && !name.contains("..")
+}
+
+/// Environment for a child process: current env plus overrides. On Windows variable names
+/// are case-insensitive, so an override replaces any spelling of the same name (the
+/// inherited `Path` must not survive next to our `PATH`; which one wins would be random).
 pub fn env_with(extra: &HashMap<String, String>) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     for (k, v) in extra {
+        if IS_WIN {
+            env.retain(|old, _| !old.eq_ignore_ascii_case(k));
+        }
         env.insert(k.clone(), v.clone());
     }
     env

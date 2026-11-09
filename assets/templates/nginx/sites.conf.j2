@@ -6,9 +6,9 @@
 {% endmacro %}
 
 server {
-    listen {{ ports.http }} default_server;
+    listen {{ bind }}{{ ports.http }} default_server;
 {% if ssl %}
-    listen {{ ports.https }} ssl default_server;
+    listen {{ bind }}{{ ports.https }} ssl default_server;
     ssl_certificate "{{ localhost_cert }}";
     ssl_certificate_key "{{ localhost_key }}";
 {% endif %}
@@ -36,6 +36,10 @@ server {
     }
 {% endif %}
 
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
     location ~ \.php$ {
         try_files $uri =404;
 {{ php_block("$document_root$fastcgi_script_name") }}
@@ -44,9 +48,9 @@ server {
 {% for s in sites %}
 
 server {
-    listen {{ ports.http }};
+    listen {{ bind }}{{ ports.http }};
 {% if s.ssl %}
-    listen {{ ports.https }} ssl;
+    listen {{ bind }}{{ ports.https }} ssl;
     ssl_certificate "{{ s.cert }}";
     ssl_certificate_key "{{ s.key }}";
 {% endif %}

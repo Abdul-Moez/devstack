@@ -35,10 +35,14 @@ Laragon first if it's running; both want ports 80, 443 and 3306.
 | Terminal with everything on PATH | **Terminal** button |
 | See caught emails | **Mail** button (Mailpit) |
 | Show a site to someone | Menu > www > Share (needs an ngrok authtoken in Preferences) |
+| Open sites from your phone on the same Wi-Fi | Preferences > General > Let other devices on my network open my sites (`ds lan on`). Off by default, so nobody else on the network can see your projects |
 | Back up / restore databases | Menu > MySQL |
 
 Command line: `ds start`, `ds stop`, `ds reload`, `ds status`, `ds new Laravel shop`,
-`ds use php php-8.4.27-ts`, `ds add php-8.5`, `ds db backup`, `ds doctor`, `ds --help`.
+`ds use php php-8.4.27-ts`, `ds add php-8.5`, `ds db backup`, `ds lan on`, `ds doctor`, `ds --help`.
+
+Adding a version with Quick add never switches to it; pick it in the Version dropdown
+(or `ds use`) when you're ready.
 
 ## Customizing
 

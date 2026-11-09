@@ -69,6 +69,8 @@ enum Cmd {
     Path { action: String },
     /// Local HTTPS: on | off | trust | untrust | status
     Ssl { action: String },
+    /// Let other devices on your network open your sites: on | off (default off)
+    Lan { action: String },
     /// Check for PHP updates and refresh cacert.pem now.
     Update,
     /// Check the setup.
@@ -322,6 +324,18 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
             "status" => log(&format!("HTTPS {}; CA trusted: {}", if app.settings.bool("ssl") { "on" } else { "off" },
                                     ssl::is_trusted(&app.paths).unwrap_or(false))),
             _ => return Err(anyhow!("Use: ds ssl on|off|trust|untrust|status")),
+        },
+        Cmd::Lan { action } => match action.as_str() {
+            "on" | "off" => {
+                app.settings.set("lan_access", serde_json::json!(action == "on"))?;
+                app.reload(&log)?;
+                log(if action == "on" {
+                    "Sites are reachable from other devices on your network (Windows may ask to allow Apache/Nginx through the firewall)."
+                } else {
+                    "Sites are reachable from this computer only."
+                });
+            }
+            _ => return Err(anyhow!("Use: ds lan on | ds lan off")),
         },
         Cmd::Update => {
             updates::daily(app, &log, true)?;

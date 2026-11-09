@@ -21,12 +21,34 @@ pub fn hosts_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    system_hosts_path()
+}
+
+fn system_hosts_path() -> PathBuf {
     if IS_WIN {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         PathBuf::from(root).join("System32").join("drivers").join("etc").join("hosts")
     } else {
         PathBuf::from("/etc/hosts")
     }
+}
+
+/// True if every line inside our block is `127.0.0.1 <host name>` (or there is no block).
+/// The elevated helper refuses anything else, so a tampered staging file can't point real
+/// domains at another address.
+pub fn block_is_safe(text: &str) -> bool {
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(BEGIN) {
+            inside = true;
+        } else if line.starts_with(END) {
+            inside = false;
+        } else if inside && !line.strip_prefix("127.0.0.1 ").is_some_and(crate::sites::valid_host) {
+            return false;
+        }
+    }
+    !inside
 }
 
 /// Read with line endings normalized to \n.
@@ -106,12 +128,18 @@ pub fn sync(app: &App, hosts: &[String], log: Log) -> Result<bool> {
     Ok(true)
 }
 
-/// Runs inside the elevated helper process. Refuses changes outside our block.
+/// Runs inside the elevated helper process. Refuses changes outside our block and block
+/// lines that aren't `127.0.0.1 <host>`.
 pub fn apply_staged(app: &App, staged: &Path) -> Result<i32> {
-    let path = hosts_path();
+    // With admin rights, only ever touch the real hosts file: DEVSTACK_HOSTS is a testing
+    // aid and must not let the helper write anywhere else.
+    let path = if IS_WIN { system_hosts_path() } else { hosts_path() };
     let new = fs::read_to_string(staged)?.replace("\r\n", "\n");
     if with_block(&new, "") != with_block(&read(&path)?, "") {
         return Ok(2);
+    }
+    if !block_is_safe(&new) {
+        return Ok(3);
     }
     backup(app, &path)?;
     write(&path, &new)?;

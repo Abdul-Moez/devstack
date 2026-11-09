@@ -10,15 +10,13 @@ php-cgi, MariaDB, Redis and Memcached. The Rust version passed the same live tes
 
 ## First tasks on Windows (do these in order)
 
-The Windows-only code paths have **never been compiled** (the port was written on Linux,
-without a Windows target). Expect a few small compile errors there; fix them first.
+Steps 1-3 are done (2026-11-09): it builds on Windows with no errors or clippy warnings,
+`cargo test` passes, and `ds status` / `ds doctor` / `ds add composer phpmyadmin` work.
+Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 
 1. Toolchain: `winget install Rustlang.Rustup` and the MSVC build tools
    (`winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`).
-2. `cargo build` and fix errors. Likely spots, all behind `#[cfg(windows)]`:
-   `src/winutil.rs` (windows-sys 0.59 types: HWND/HANDLE are `*mut c_void`; winreg `RegValue`),
-   `src/procs.rs` (creation flags), `src/gui/mod.rs` (getting the HWND from
-   `CreationContext` via raw-window-handle), `build.rs` (winresource icon).
+2. `cargo build`, then `cargo clippy --all-targets` (keep it warning-free).
 3. `cargo test` must pass.
 4. `cargo run --bin devstack` (data goes to `./dev-root`, see `.cargo/config.toml`) and walk
    through: Quick add PHP 8.4 + Apache + MySQL 8.4 + Mailpit + Composer + phpMyAdmin → Start All
@@ -75,7 +73,20 @@ without a Windows target). Expect a few small compile errors there; fix them fir
 7. **Win32 code only in `winutil.rs`** (plus the HWND lookup in `gui/mod.rs` and creation flags
    in `procs.rs`/`util.rs`). Keep everything else cross-platform so it can be tested on Linux.
 8. The GUI thread never blocks: slow work goes through `Jobs::spawn`.
-9. Downloads with a published checksum are verified; mismatches are hard errors.
+9. Downloads with a published checksum are verified; mismatches are hard errors. Downloads
+   are HTTPS only.
+10. **Untrusted names are validated before they touch the disk or admin code.** Folder and
+    file names from download sources go through `util::safe_file_name`; host names (from
+    `www/` folders, the host name template, `usr/sites.json`) through `sites::valid_host`,
+    because they end up in the hosts file. The elevated hosts helper only accepts
+    `127.0.0.1 <host>` lines (`hosts::block_is_safe`) and ignores `DEVSTACK_HOSTS`.
+11. **Local only by default.** Apache/Nginx listen on 127.0.0.1 unless `lan_access` is on
+    (Preferences, `ds lan on`); every other service always binds 127.0.0.1. Dotfiles
+    (`.env`, `.git`) are never served.
+12. **A Quick add install never switches versions.** `packages::pin_version` saves the
+    version that was active before (`versions.<tool>`); only `switch_version` changes it.
+13. Secrets stay off command lines (ngrok gets `NGROK_AUTHTOKEN`, MySQL tools read
+    `etc/mysql/client.cnf`).
 
 ## How PHP is wired (and why)
 

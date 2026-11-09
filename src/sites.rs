@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::Value;
@@ -40,6 +41,17 @@ pub fn host_for(name: &str, template: &str) -> String {
     }
 }
 
+/// A plain DNS host name (lowercase labels, no wildcard, no spaces). Host names end up in the
+/// hosts file (written with admin rights) and in Apache/Nginx configs, so anything else from
+/// usr/sites.json or the host name template is ignored.
+pub fn valid_host(h: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    h.len() <= 253
+        && RE
+            .get_or_init(|| Regex::new(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$").unwrap())
+            .is_match(h)
+}
+
 pub fn discover(app: &App) -> Vec<Site> {
     let www = app.paths().www;
     let Ok(rd) = fs::read_dir(&www) else { return vec![] };
@@ -59,8 +71,8 @@ pub fn discover(app: &App) -> Vec<Site> {
         if o.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
             continue;
         }
-        let host = o.get("host").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| host_for(&name, &template));
-        if host.is_empty() {
+        let host = o.get("host").and_then(Value::as_str).map(str::to_lowercase).unwrap_or_else(|| host_for(&name, &template));
+        if !valid_host(&host) {
             continue;
         }
         let path = d.path();
@@ -72,7 +84,7 @@ pub fn discover(app: &App) -> Vec<Site> {
         let aliases = o
             .get("aliases")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_lowercase)).filter(|x| valid_host(x)).collect())
             .unwrap_or_default();
         let ssl = o.get("ssl").and_then(Value::as_bool).unwrap_or(ssl_default) && ssl_default;
         sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new() });

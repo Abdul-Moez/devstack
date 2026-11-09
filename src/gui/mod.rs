@@ -263,7 +263,7 @@ impl GuiApp {
             log: vec![],
             rows: vec![],
             ssl_on: false,
-            last_refresh: Instant::now() - Duration::from_secs(10),
+            last_refresh: Instant::now(), // refresh() below runs right away
             start_hidden,
             first_frame: true,
             exiting: false,
@@ -296,6 +296,9 @@ impl GuiApp {
 
     fn refresh(&mut self) {
         let app = self.jobs.app.clone();
+        // Pick up changes made with `ds` (or by hand) while the window is open.
+        app.settings.refresh();
+        app.secrets.refresh();
         let mut any_up = false;
         self.rows = app
             .services()
@@ -809,7 +812,7 @@ fn start_ticker(jobs: Jobs) {
 
 // ------------------------------------------------------------------------- preferences
 const PREF_KEYS: &[&str] = &[
-    "hostname_template", "www_dir", "editor", "terminal", "start_all_on_launch", "run_on_startup", "minimize_to_tray",
+    "hostname_template", "www_dir", "editor", "terminal", "lan_access", "start_all_on_launch", "run_on_startup", "minimize_to_tray",
     "stop_all_on_exit", "php.children", "php.memory_limit", "php.upload_max_filesize", "php.post_max_size",
     "php.max_execution_time", "php.timezone", "php.build", "php.auto_update", "php.auto_switch", "ports",
     "backup.enabled", "backup.interval_hours", "backup.keep", "quick_app.create_database", "quick_app.open_browser", "updates.cacert",
@@ -903,6 +906,7 @@ impl Prefs {
                     ui.end_row();
                     self.text(ui, "Editor (empty = Notepad)", "editor");
                     self.choice(ui, "Terminal", "terminal", &["cmd", "powershell", "pwsh", "wt"]);
+                    self.check(ui, "Let other devices on my network open my sites", "lan_access");
                     self.check(ui, "Start all services when devstack opens", "start_all_on_launch");
                     self.check(ui, "Run devstack when Windows starts", "run_on_startup");
                     self.check(ui, "Closing the window keeps devstack in the tray", "minimize_to_tray");
@@ -951,6 +955,7 @@ impl Prefs {
     }
 
     fn save(&self, app: &App) -> Result<()> {
+        app.settings.refresh(); // keep settings changed elsewhere that aren't on this dialog
         for k in PREF_KEYS {
             app.settings.put(k, self.get(k));
         }

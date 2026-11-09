@@ -15,14 +15,14 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::assets;
 use crate::core::App;
 use crate::error::package_err;
-use crate::util::{hex, load_json, parse_version, version_key};
-use crate::versions::candidates;
+use crate::util::{hex, load_json, parse_version, safe_file_name, version_key};
+use crate::versions::{candidates, Version};
 use crate::Log;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) devstack/0.1";
@@ -81,25 +81,48 @@ pub fn http_json(url: &str) -> Result<Value> {
 }
 
 pub fn download(url: &str, dest: &Path, referer: Option<&str>, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    if !url.starts_with("https://") {
+        return Err(package_err(format!("Refusing to download over plain HTTP: {url}")));
+    }
     fs::create_dir_all(dest.parent().unwrap())?;
     let part = dest.with_extension("part");
-    let mut r = get(url, referer)?;
-    let total = r.content_length().unwrap_or(0);
-    let mut f = fs::File::create(&part)?;
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut done = 0u64;
-    loop {
-        let n = r.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let result = (|| -> Result<()> {
+        let mut r = get(url, referer)?;
+        let total = r.content_length().unwrap_or(0);
+        let mut f = fs::File::create(&part)?;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done = 0u64;
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            f.write_all(&buf[..n])?;
+            done += n as u64;
+            progress(done, total);
         }
-        f.write_all(&buf[..n])?;
-        done += n as u64;
-        progress(done, total);
+        drop(f);
+        fs::rename(&part, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
     }
-    drop(f);
-    fs::rename(&part, dest)?;
-    Ok(())
+    result
+}
+
+/// The SHA-256 for `file` from a published checksum list (`<hash>  <file name>` per line,
+/// as in sha256sum output, Node's SHASUMS256.txt, Composer's and phpMyAdmin's .sha256 files).
+pub fn published_sha256(list_url: &str, file: &str) -> Result<String> {
+    let text = String::from_utf8_lossy(&http_get(list_url, None)?).into_owned();
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?.trim_start_matches('*')))
+        })
+        .find(|(hash, name)| *name == file && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|(hash, _)| hash.to_lowercase())
+        .ok_or_else(|| package_err(format!("No checksum for {file} in {list_url}.")))
 }
 
 pub fn sha256_of(path: &Path) -> Result<String> {
@@ -193,10 +216,11 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                 let v = s(r, "version");
                 let lts = r.get("lts").map(|l| !(l.is_null() || l == &Value::Bool(false))).unwrap_or(false);
                 if has_zip && ((major == "lts" && lts) || v.starts_with(&format!("v{major}."))) {
+                    let file = format!("node-{v}-win-x64.zip");
                     return Ok(Resolved {
-                        url: format!("https://nodejs.org/dist/{v}/node-{v}-win-x64.zip"),
+                        url: format!("https://nodejs.org/dist/{v}/{file}"),
                         folder: format!("node-{}", v.trim_start_matches('v')),
-                        sha256: None,
+                        sha256: Some(published_sha256(&format!("https://nodejs.org/dist/{v}/SHASUMS256.txt"), &file)?),
                         filename: None,
                     });
                 }
@@ -228,10 +252,12 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
         "composer" => {
             let v = http_json("https://getcomposer.org/versions")?;
             let stable = &v["stable"][0];
+            let version = s(stable, "version");
+            let sums = format!("https://getcomposer.org/download/{version}/composer.phar.sha256sum");
             Ok(Resolved {
                 url: format!("https://getcomposer.org{}", s(stable, "path")),
-                folder: format!("composer-{}", s(stable, "version")),
-                sha256: None,
+                folder: format!("composer-{version}"),
+                sha256: Some(published_sha256(&sums, "composer.phar")?),
                 filename: Some("composer.phar".into()),
             })
         }
@@ -262,10 +288,12 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
             }
             let v = http_json("https://www.phpmyadmin.net/home_page/version.json")?;
             let ver = s(&v, "version");
+            let file = format!("phpMyAdmin-{ver}-all-languages.zip");
+            let url = format!("https://files.phpmyadmin.net/phpMyAdmin/{ver}/{file}");
             Ok(Resolved {
-                url: format!("https://files.phpmyadmin.net/phpMyAdmin/{ver}/phpMyAdmin-{ver}-all-languages.zip"),
+                sha256: Some(published_sha256(&format!("{url}.sha256"), &file)?),
+                url,
                 folder: format!("phpmyadmin-{ver}"),
-                sha256: None,
                 filename: None,
             })
         }
@@ -382,26 +410,45 @@ fn find_dir(root: &Path, names: &[String], depth: usize) -> Option<PathBuf> {
     None
 }
 
+/// Keep the version that was active before an install. Without a saved choice, the active
+/// version is simply the newest one, so installing a newer PHP or MySQL would silently
+/// switch to it (for MySQL that means a different, empty data folder).
+pub fn pin_version(app: &App, tool: &str, before: Option<Version>, installed: &str) -> Result<()> {
+    let key = format!("versions.{tool}");
+    let saved = app.settings.str(&key);
+    if !saved.is_empty() && app.versions(tool).iter().any(|v| v.name == saved) {
+        return Ok(());
+    }
+    let keep = before.map_or_else(|| installed.to_string(), |v| v.name);
+    app.settings.set(&key, json!(keep))
+}
+
 pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
     log(&format!("Looking up {}…", item.label));
     let r = resolve(app, item)?;
+    if !safe_file_name(&r.folder) {
+        return Err(package_err(format!("Refusing to install into an unsafe folder name: {:?}", r.folder)));
+    }
     let dest_root = app.versions_root(&item.tool);
     let target = dest_root.join(&r.folder);
     if target.exists() {
         log(&format!("{} is already installed.", r.folder));
         return Ok(target);
     }
+    let before = app.active(&item.tool);
     let mut name = r.filename.clone().unwrap_or_else(|| url_file(&r.url));
     if name.is_empty() || !name.contains('.') {
         name = format!("{}.zip", r.folder);
+    }
+    if !safe_file_name(&name) {
+        return Err(package_err(format!("Refusing to download to an unsafe file name: {name:?}")));
     }
     let file = app.paths.tmp.join("downloads").join(&name);
     log(&format!("Downloading {}", r.url));
     let mut last = u64::MAX;
     let referer = item.source.get("page").and_then(Value::as_str);
     download(&r.url, &file, referer, &mut |done, total| {
-        if total > 0 {
-            let step = done * 10 / total;
+        if let Some(step) = (done * 10).checked_div(total) {
             if step != last {
                 last = step;
                 log(&format!("  {}% of {} MB", step * 10, total / (1024 * 1024)));
@@ -422,6 +469,7 @@ pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
         if item.tool == "composer" {
             fs::write(target.join("composer.bat"), "@echo off\r\nphp \"%~dp0composer.phar\" %*\r\n")?;
         }
+        pin_version(app, &item.tool, before, &r.folder)?;
         log(&format!("Installed {}", r.folder));
         return Ok(target);
     }
@@ -431,12 +479,14 @@ pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
     let cands = candidates(&item.tool);
     let Some(found) = find_dir(&ex, &cands, 3) else {
         let _ = fs::remove_dir_all(&ex);
+        let _ = fs::remove_file(&file);
         return Err(package_err(format!("The archive doesn't contain {}.", cands.join(", "))));
     };
     fs::create_dir_all(&dest_root)?;
     fs::rename(&found, &target).with_context(|| format!("moving into {}", target.display()))?;
     let _ = fs::remove_dir_all(&ex);
     let _ = fs::remove_file(&file);
+    pin_version(app, &item.tool, before, &r.folder)?;
     log(&format!("Installed {} {} → {}", item.tool, r.folder, target.display()));
     Ok(target)
 }

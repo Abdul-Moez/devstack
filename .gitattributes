@@ -1,0 +1,7 @@
+# Text files keep LF everywhere (the repo started on Linux; Rust and Inno Setup are fine with it).
+* text=auto eol=lf
+
+# Never touch the bytes of these.
+*.ico binary
+*.rgba binary
+*.png binary

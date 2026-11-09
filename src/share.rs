@@ -1,5 +1,6 @@
 //! Share a local site on the internet through ngrok.
 
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use crate::error::service_err;
 use crate::procs::{alive, kill_tree, spawn};
 use crate::settings::ProcRec;
 use crate::sites::Site;
-use crate::util::fwd;
+use crate::util::{env_with, fwd};
 use crate::Log;
 
 const SID: &str = "share";
@@ -29,8 +30,11 @@ pub fn start(app: &App, site: &Site, log: Log) -> Result<String> {
     stop(app, log)?;
     let port = app.settings.port("http");
     let cmd = vec![fwd(&v.exe), "http".into(), port.to_string(), format!("--host-header={}", site.host),
-                   "--authtoken".into(), token, "--log".into(), "stdout".into()];
-    let mut rec = spawn(&cmd, &v.path, None, &app.paths.logs.join("ngrok.log"))?;
+                   "--log".into(), "stdout".into()];
+    // The token goes in the environment, not on the command line, where any program on the
+    // machine could read it from the process list.
+    let env = env_with(&HashMap::from([("NGROK_AUTHTOKEN".to_string(), token)]));
+    let mut rec = spawn(&cmd, &v.path, Some(&env), &app.paths.logs.join("ngrok.log"))?;
     rec.site = Some(site.name.clone());
     app.state.set_procs(SID, std::slice::from_ref(&rec))?;
     let start = Instant::now();

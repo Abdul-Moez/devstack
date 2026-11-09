@@ -3,9 +3,9 @@ ServerRoot "{{ apache_dir }}"
 DefaultRuntimeDir "{{ tmp }}/apache"
 PidFile "{{ tmp }}/apache/httpd.pid"
 
-Listen {{ ports.http }}
+Listen {{ bind }}{{ ports.http }}
 {% if ssl %}
-Listen {{ ports.https }}
+Listen {{ bind }}{{ ports.https }}
 {% endif %}
 
 {% for m in apache_modules %}
@@ -56,6 +56,9 @@ DirectoryIndex index.php index.html index.htm /__devstack/index.php
 <Files ".ht*">
     Require all denied
 </Files>
+
+# Never serve dotfiles and dot-folders (.env, .git, ...), except .well-known.
+RedirectMatch 404 "/\.(?!well-known)"
 
 {% if php_apache_module %}
 # PHP runs inside Apache (thread-safe PHP build). Its folder is put on Apache's PATH so

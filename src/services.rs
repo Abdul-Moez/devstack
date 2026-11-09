@@ -395,12 +395,18 @@ impl Service for Nginx {
 pub struct Php;
 
 pub fn php_children(app: &App) -> u16 {
-    app.settings.u64("php.children", 10).max(4) as u16
+    u16::try_from(app.settings.u64("php.children", 10).clamp(4, 64)).unwrap_or(10)
 }
 
 pub fn php_pool_ports(app: &App) -> Vec<u16> {
-    let base = app.state.value("php_port_base").as_u64().map(|b| b as u16).unwrap_or_else(|| app.settings.port("php"));
-    (0..php_children(app)).map(|i| base + i).collect()
+    let base = app
+        .state
+        .value("php_port_base")
+        .as_u64()
+        .and_then(|b| u16::try_from(b).ok())
+        .filter(|b| *b != 0)
+        .unwrap_or_else(|| app.settings.port("php"));
+    (0..php_children(app)).filter_map(|i| base.checked_add(i)).collect()
 }
 
 /// Pick the pool's base port before configs are generated.
@@ -411,7 +417,7 @@ pub fn php_plan_ports(app: &App) -> Result<()> {
     let mut base = app.settings.port("php");
     let n = php_children(app);
     let table = listening();
-    if (base..base + n).any(|p| table.contains_key(&p)) {
+    if (base..base.saturating_add(n)).any(|p| table.contains_key(&p)) {
         base = app.settings.port("php_fallback");
     }
     app.state.put("php_port_base", json!(base))
@@ -435,12 +441,12 @@ pub fn php_heal(app: &App, log: Log) -> Result<usize> {
     let env = full_env(&Php, app, &v);
     let n = recs.len();
     let mut fixed = 0;
-    for i in 0..n {
-        if !alive(&recs[i]) {
-            if let Some(port) = recs[i].port {
+    for (i, rec) in recs.iter_mut().enumerate() {
+        if !alive(rec) {
+            if let Some(port) = rec.port {
                 let mut new = spawn(&php_command(&v, port), &v.path, env.as_ref(), &Php.log_path(app, i, n))?;
                 new.port = Some(port);
-                recs[i] = new;
+                *rec = new;
                 fixed += 1;
             }
         }

@@ -114,7 +114,7 @@ pub fn update_user_path(add: &[PathBuf], remove: &[PathBuf]) -> Result<()> {
     let joined = parts.join(";");
     let bytes: Vec<u8> = joined.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect();
     let vtype = if matches!(kind, RegType::REG_SZ) { RegType::REG_SZ } else { RegType::REG_EXPAND_SZ };
-    env.set_raw_value("Path", &RegValue { bytes: bytes.into(), vtype })?;
+    env.set_raw_value("Path", &RegValue { bytes, vtype })?;
     broadcast_env_change();
     Ok(())
 }
@@ -232,23 +232,43 @@ pub fn hide_window(_hwnd: isize) {}
 pub fn single_instance(root: &Path) -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
     use sha1::Digest;
     let hash = crate::util::hex(&sha1::Sha1::digest(root.display().to_string().to_lowercase().as_bytes()));
     let name = wide(&format!("Local\\devstack-{}", &hash[..12]));
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         if !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            let title = wide(crate::APP_NAME);
-            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-            if !hwnd.is_null() {
-                show_window(hwnd as isize);
+            if let Some(hwnd) = find_running_window() {
+                show_window(hwnd);
             }
             return false;
         }
         // The mutex handle is intentionally leaked: it lives as long as the process.
     }
     true
+}
+
+/// The window of the devstack that is already running. Matched by title *and* by the owning
+/// process's executable name, because an Explorer window open on C:\devstack has the same title.
+#[cfg(windows)]
+fn find_running_window() -> Option<isize> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    let me = std::env::current_exe().ok()?.file_name()?.to_string_lossy().to_lowercase();
+    let title = wide(crate::APP_NAME);
+    let mut after: HWND = std::ptr::null_mut();
+    loop {
+        let hwnd = unsafe { FindWindowExW(std::ptr::null_mut(), after, std::ptr::null(), title.as_ptr()) };
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid != std::process::id() && crate::procs::process_name(pid).is_some_and(|n| n.to_lowercase() == me) {
+            return Some(hwnd as isize);
+        }
+        after = hwnd;
+    }
 }
 
 #[cfg(not(windows))]
@@ -288,11 +308,21 @@ pub fn open_terminal(cwd: &Path, env: &std::collections::HashMap<String, String>
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x10;
         let mut c = match kind {
-            // Windows Terminal may reuse a window that doesn't have our PATH, so set it explicitly.
+            // wt.exe usually hands the new window to an already running Windows Terminal,
+            // which doesn't inherit our environment, and it treats ';' (all over PATH) as a
+            // command separator. So the environment goes into a small script the tab runs.
             "wt" => {
-                let path = env.get("PATH").cloned().unwrap_or_default();
+                let script = std::env::temp_dir().join("devstack-terminal.cmd");
+                let mut text = String::from("@echo off\r\n");
+                for key in ["PATH", "COMPOSER_HOME", "PHPRC"] {
+                    if let Some(v) = env.get(key) {
+                        text.push_str(&format!("set \"{key}={}\"\r\n", v.replace('%', "%%")));
+                    }
+                }
+                text.push_str("title devstack\r\n");
+                std::fs::write(&script, text).context("couldn't write the terminal start script")?;
                 let mut c = Command::new("wt.exe");
-                c.args(["-w", "new", "-d"]).arg(cwd).args(["cmd.exe", "/k"]).arg(format!("set \"PATH={path}\""));
+                c.args(["-w", "new", "-d"]).arg(cwd).args(["cmd.exe", "/k"]).arg(&script);
                 c
             }
             "powershell" => {
