@@ -1,0 +1,64 @@
+[package]
+name = "devstack"
+version = "0.1.0"
+edition = "2021"
+description = "A personal, portable Laragon-style local dev environment for Windows"
+default-run = "devstack"
+
+[lib]
+name = "devstack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devstack"          # tray app + window (no console)
+path = "src/bin/devstack.rs"
+
+[[bin]]
+name = "ds"                # command line
+path = "src/bin/ds.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+minijinja = { version = "2", features = ["loader"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+zip = "2"
+sha2 = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+time = "0.3"
+sysinfo = "0.35"
+netstat2 = "0.11"
+open = "5"
+qrcode = { version = "0.14", default-features = false }
+eframe = "0.31"
+tray-icon = "0.20"
+raw-window-handle = "0.6"
+rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+junction = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

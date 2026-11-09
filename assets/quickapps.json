@@ -1,0 +1,14 @@
+[
+  {"name": "Blank", "type": "blank"},
+  {"name": "WordPress", "type": "zip", "url": "https://wordpress.org/latest.zip", "wordpress": true},
+  {"name": "Laravel", "type": "composer", "package": "laravel/laravel"},
+  {"name": "Laravel (installer)", "type": "command", "command": "laravel new {name} --no-interaction"},
+  {"name": "Laravel starter kit: React", "type": "composer", "package": "laravel/react-starter-kit"},
+  {"name": "Laravel starter kit: Vue", "type": "composer", "package": "laravel/vue-starter-kit"},
+  {"name": "Laravel starter kit: Livewire", "type": "composer", "package": "laravel/livewire-starter-kit"},
+  {"name": "Symfony", "type": "composer", "package": "symfony/skeleton"},
+  {"name": "Symfony (webapp)", "type": "composer", "package": "symfony/website-skeleton"},
+  {"name": "Drupal", "type": "composer", "package": "drupal/recommended-project"},
+  {"name": "CodeIgniter 4", "type": "composer", "package": "codeigniter4/appstarter"},
+  {"name": "Slim", "type": "composer", "package": "slim/slim-skeleton"}
+]

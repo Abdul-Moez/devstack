@@ -1,0 +1,4 @@
+# While developing (cargo run / cargo test), keep runtime data in ./dev-root instead of
+# next to target/debug/devstack.exe. Installed builds use the exe's own folder.
+[env]
+DEVSTACK_ROOT = { value = "dev-root", relative = true }
