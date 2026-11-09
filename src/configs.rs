@@ -77,10 +77,12 @@ pub fn php_enabled_extensions(app: &App, v: &Version) -> Vec<String> {
 
 fn php_extension_lines(app: &App, v: &Version) -> (Vec<String>, Vec<String>) {
     let available: HashSet<String> = php_available_extensions(v).into_iter().collect();
-    let exts = php_enabled_extensions(app, v)
+    let mut exts: Vec<String> = php_enabled_extensions(app, v)
         .into_iter()
         .filter(|e| available.contains(e) && !ZEND_EXTENSIONS.contains(&e.as_str()))
         .collect();
+    // Older PHP builds load exif only after mbstring.
+    exts.sort_by_key(|e| (e != "mbstring", e.clone()));
     let mut zend = vec![];
     if available.contains("opcache") {
         zend.push("opcache".to_string()); // PHP <= 8.4; 8.5 has OPcache built in
@@ -147,8 +149,13 @@ pub fn context(app: &App, sites: &[Site]) -> Result<Value> {
         "sites": sites.iter().map(|x| json!({
             "name": x.name, "host": x.host, "aliases": x.aliases, "docroot": fwd(&x.docroot),
             "ssl": x.ssl, "cert": x.cert, "key": x.key,
+            "proxy": x.proxy.map(|p| format!("http://127.0.0.1:{p}")).unwrap_or_default(),
         })).collect::<Vec<_>>(),
         "php": s.get("php"),
+        // PHP 7.0/7.1 only understand "extension=php_curl.dll", not "extension=curl".
+        "php_ext_dll": php.as_ref().is_some_and(|v| v.key() < vec![7, 2]),
+        // serialize_precision = -1 exists since PHP 7.1.
+        "php_modern_precision": php.as_ref().is_none_or(|v| v.key() >= vec![7, 1]),
         "php_ports": php_pool_ports(app),
         "hostname_template": s.str("hostname_template"),
         "cacert": if cacert.exists() { fwd(&cacert) } else { String::new() },

@@ -11,7 +11,7 @@
     </Directory>
 {% endif %}
 {% endmacro %}
-{% macro site(s) %}
+{% macro site(s, scheme) %}
     ServerName {{ s.host }}
     ServerAlias *.{{ s.host }}{% for a in s.aliases %} {{ a }}{% endfor %}
 
@@ -22,6 +22,15 @@
         Require all granted
         CGIPassAuth On
     </Directory>
+{% if s.proxy %}
+    # Requests go to the app server set as "proxy" in usr/sites.json.
+    ProxyPreserveHost On
+    <IfModule headers_module>
+        RequestHeader set X-Forwarded-Proto "{{ scheme }}"
+    </IfModule>
+    ProxyPass / {{ s.proxy }}/
+    ProxyPassReverse / {{ s.proxy }}/
+{% endif %}
 {% endmacro %}
 
 <VirtualHost *:{{ ports.http }}>
@@ -39,12 +48,12 @@
 {% for s in sites %}
 
 <VirtualHost *:{{ ports.http }}>
-{{ site(s) }}
+{{ site(s, "http") }}
 </VirtualHost>
 {% if s.ssl %}
 
 <VirtualHost *:{{ ports.https }}>
-{{ site(s) }}
+{{ site(s, "https") }}
     SSLEngine on
     SSLCertificateFile "{{ s.cert }}"
     SSLCertificateKeyFile "{{ s.key }}"

@@ -146,6 +146,26 @@ pub fn set_autostart(_command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Installed Visual C++ 2015+ runtime (x64) as (major, minor, build), from the registry key
+/// its installer writes.
+#[cfg(windows)]
+pub fn vc_runtime_version() -> Option<(u32, u32, u32)> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64", KEY_READ | KEY_WOW64_64KEY)
+        .ok()?;
+    if key.get_value::<u32, _>("Installed").ok()? != 1 {
+        return None;
+    }
+    Some((key.get_value("Major").ok()?, key.get_value("Minor").ok()?, key.get_value("Bld").ok()?))
+}
+
+#[cfg(not(windows))]
+pub fn vc_runtime_version() -> Option<(u32, u32, u32)> {
+    None
+}
+
 pub fn gui_command(root: &Path) -> String {
     format!("{} --hidden", quote_arg(&root.join(crate::util::exe("devstack")).display().to_string()))
 }
@@ -300,6 +320,24 @@ pub fn edit_file(path: &Path, editor: &str) -> Result<()> {
         open_path(path)?;
     }
     Ok(())
+}
+
+/// Run a script in its own console window (e.g. a project's dev server), left open so its
+/// output stays visible.
+pub fn open_console(script: &Path, cwd: &Path, env: &std::collections::HashMap<String, String>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x10;
+        Command::new("cmd.exe").arg("/k").arg(script).current_dir(cwd).env_clear().envs(env)
+            .creation_flags(CREATE_NEW_CONSOLE).spawn().context("couldn't open a console")?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (script, cwd, env);
+        anyhow::bail!("starting a dev server console is only supported on Windows")
+    }
 }
 
 pub fn open_terminal(cwd: &Path, env: &std::collections::HashMap<String, String>, kind: &str) -> Result<()> {

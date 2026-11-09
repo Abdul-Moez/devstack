@@ -55,6 +55,22 @@ pub fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Copy a folder tree (regular files and folders only).
+pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &dest).with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn read_text(path: &Path) -> String {
     fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
 }

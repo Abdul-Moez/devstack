@@ -1,9 +1,26 @@
 # devstack
 
 A personal, portable Laragon-style dev environment for Windows 10/11, written in Rust.
-Tray icon + window + command line. Apache or Nginx, PHP, MySQL/MariaDB, PostgreSQL, MongoDB,
-Redis, Memcached, Mailpit; every folder in `www\` becomes `https://name.test` with a trusted
-certificate.
+Tray icon + window + command line. Apache or Nginx, PHP, Python, Node.js, MySQL/MariaDB,
+PostgreSQL, MongoDB, Redis, Memcached, Mailpit; every folder in `www\` becomes
+`https://name.test` with a trusted certificate.
+
+Several versions of each can sit side by side (switch with the Version dropdown):
+
+| Tool | Versions in Quick add |
+|---|---|
+| PHP | 8.5, 8.4, 8.3, 8.2, 8.1, 8.0, 7.4, 7.3, 7.2, 7.1, 7.0 |
+| Python | 3.15, 3.14, 3.13, 3.12, 3.11, 3.10, 3.9, 3.8 (full Python with pip and venv) |
+| MySQL | 26.10 Innovation, 9.7 LTS, 8.4 LTS, 8.0, 5.7, 5.6 |
+| MariaDB | 12.3, 11.8, 11.4, 10.11, 10.6 (all LTS) |
+| PostgreSQL | 18, 17, 16, 15, 14, 13 |
+| MongoDB | newest, 8.0, 7.0, 6.0 |
+| Node.js | current LTS, 26, 24, 22, 20, 18, 16 |
+| Composer | latest, and 2.2 LTS (used automatically with PHP 7.0/7.1) |
+
+Each MySQL/MariaDB series keeps its own data folder, so switching versions never touches
+another version's databases. MySQL 5.6 needs the Visual C++ 2010 runtime (`ds doctor` says
+so if it's missing).
 
 ## Install
 
@@ -28,7 +45,8 @@ Laragon first if it's running; both want ports 80, 443 and 3306.
 
 | Want to… | Do |
 |---|---|
-| New project | Menu > Quick app > Laravel / WordPress / Symfony / … |
+| New project | Menu > Quick app > Laravel (latest or 11/10/9/8/6/5.5) / WordPress / Symfony / Django / Flask / … |
+| Django or Flask | Quick app makes the project with its own `.venv`, starts the dev server in a console window (`run.bat` starts it again later) and https://name.test forwards to it |
 | Switch PHP / MySQL / Node version | Version dropdown in the table, or Menu > PHP > Version |
 | Toggle a PHP extension | Menu > PHP > Extensions |
 | php/composer/node/mysql in any terminal | Menu > Tools > PATH > Add devstack to PATH |
@@ -49,6 +67,8 @@ Adding a version with Quick add never switches to it; pick it in the Version dro
 * Extra settings: `usr\php.ini`, `usr\my.ini`, `usr\redis.conf`, `usr\postgresql.conf`
 * Extra Apache/Nginx config: any `*.conf` in `usr\apache\` or `usr\nginx\`
 * Per-site options (docroot, aliases, no SSL, another host name): `usr\sites.json`
+* Any app server (Django, Flask, Node, …) behind https://name.test: `usr\sites.json` →
+  `{"myapp": {"proxy": 3000}}`
 * Replace a config template: put your copy in `usr\templates\` (same path as in `assets\templates\`)
 * Quick app recipes: `usr\quickapps.json`; extra Quick add packages: `usr\packages.json`
 

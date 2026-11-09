@@ -150,6 +150,131 @@ fn elevated_hosts_helper_only_accepts_loopback_entries() {
 }
 
 #[test]
+fn old_php_builds_are_found_in_the_archive_listing() {
+    use devstack::packages::newest_php_archive;
+    let html = r#"<a href="php-7.1.9-Win32-VC14-x64.zip"> <a href="php-7.1.33-Win32-VC14-x64.zip"> <a href="php-7.1.33-Win32-VC14-x86.zip">
+                  <a href="php-7.1.33-nts-Win32-VC14-x64.zip"> <a href="php-7.4.33-Win32-vc15-x64.zip"> <a href="php-7.10.1-Win32-VC14-x64.zip">"#;
+    assert_eq!(newest_php_archive(html, "7.1", "ts"), Some((33, "php-7.1.33-Win32-VC14-x64.zip".into())));
+    assert_eq!(newest_php_archive(html, "7.1", "nts"), Some((33, "php-7.1.33-nts-Win32-VC14-x64.zip".into())));
+    assert_eq!(newest_php_archive(html, "7.4", "ts"), Some((33, "php-7.4.33-Win32-vc15-x64.zip".into())));
+    assert_eq!(newest_php_archive(html, "7.0", "ts"), None);
+}
+
+#[test]
+fn php_7_0_and_7_1_get_full_extension_file_names() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    let php = root.join("bin/php/php-7.1.33-ts");
+    touch(&php.join(exe("php-cgi")));
+    for e in ["curl", "exif", "mbstring", "opcache"] {
+        touch(&php.join("ext").join(format!("php_{e}.dll")));
+    }
+    app.generate(&|_| {}).unwrap();
+    let ini = fs::read_to_string(php.join("php.ini")).unwrap();
+    assert!(ini.contains("extension=php_curl.dll") && ini.contains("zend_extension=php_opcache.dll"), "{ini}");
+    assert!(ini.find("extension=php_mbstring.dll").unwrap() < ini.find("extension=php_exif.dll").unwrap(), "mbstring loads before exif");
+    assert!(ini.contains("serialize_precision = -1"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proxied_sites_forward_to_their_app_server() {
+    use devstack::sites::proxy_port;
+    use serde_json::json;
+    assert_eq!(proxy_port(Some(&json!(8001))), Some(8001));
+    assert_eq!(proxy_port(Some(&json!("8002"))), Some(8002));
+    for bad in [json!(0), json!(70000), json!("http://evil/"), json!("8001; include x"), json!(true)] {
+        assert_eq!(proxy_port(Some(&bad)), None, "{bad} must be rejected");
+    }
+
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    touch(&root.join("bin/apache/apache-2.4.70/bin").join(exe("httpd")));
+    touch(&root.join("bin/nginx/nginx-1.28.0").join(exe("nginx")));
+    fs::create_dir_all(root.join("www/api")).unwrap();
+    fs::create_dir_all(root.join("www/blog")).unwrap();
+    fs::write(root.join("usr/sites.json"), r#"{"api": {"proxy": 8001}}"#).unwrap();
+    app.generate(&|_| {}).unwrap();
+    let apache = fs::read_to_string(root.join("etc/apache/sites.conf")).unwrap();
+    assert_eq!(apache.matches("ProxyPass / http://127.0.0.1:8001/").count(), 2, "http and https vhosts");
+    assert!(apache.contains(r#"X-Forwarded-Proto "https""#));
+    let nginx = fs::read_to_string(root.join("etc/nginx/sites.conf")).unwrap();
+    assert_eq!(nginx.matches("proxy_pass http://127.0.0.1:8001;").count(), 1);
+    assert!(nginx.contains("try_files $uri $uri/ /index.php$is_args$args;"), "normal sites still serve PHP");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn quick_app_recipes_merge_with_the_users_own() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    let names: Vec<String> = devstack::quickapp::recipes(&app).into_iter().map(|r| r.name).collect();
+    for n in ["Laravel", "WordPress", "Django", "Flask", "Laravel 8 (PHP 7.3+)"] {
+        assert!(names.iter().any(|x| x == n), "{n} missing from {names:?}");
+    }
+    fs::write(root.join("usr/quickapps.json"), r#"[{"name": "Flask", "type": "blank"}, {"name": "Mine", "type": "blank"}]"#).unwrap();
+    let list = devstack::quickapp::recipes(&app);
+    assert_eq!(list.iter().find(|r| r.name == "Flask").unwrap().kind, "blank", "user recipe replaces the built-in one");
+    assert!(list.iter().any(|r| r.name == "Mine") && list.iter().any(|r| r.name == "Django"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn old_php_uses_composer_2_2() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    touch(&root.join("bin/php/php-7.1.33-ts").join(exe("php-cgi")));
+    touch(&root.join("bin/composer/composer-2.11.1/composer.phar"));
+    let err = devstack::quickapp::composer_cmd(&app).unwrap_err().to_string();
+    assert!(err.contains("Composer 2.2 LTS"), "{err}");
+    touch(&root.join("bin/composer/composer-2.2.31/composer.phar"));
+    assert!(devstack::quickapp::composer_cmd(&app).unwrap().1.contains("composer-2.2.31"));
+    touch(&root.join("bin/php/php-8.4.14-ts").join(exe("php-cgi")));
+    app.settings.set("versions.php", serde_json::json!("php-8.4.14-ts")).unwrap();
+    app.settings.set("versions.composer", serde_json::json!("composer-2.11.1")).unwrap();
+    assert!(devstack::quickapp::composer_cmd(&app).unwrap().1.contains("composer-2.11.1"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn mysql_5_6_starts_from_the_bundled_data_folder() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    let base = root.join("bin/mysql/mysql-5.6.51");
+    touch(&base.join("bin").join(exe("mysqld")));
+    touch(&base.join("data/mysql/user.frm"));
+    touch(&base.join("data/ibdata1"));
+    let v = app.active("mysql").unwrap();
+    if devstack::services::mysql_missing_runtime(&v).is_some() {
+        return; // this machine has no Visual C++ 2010 runtime; prepare() refuses, as intended
+    }
+    app.svc("mysql").prepare(&app, &v, &|_| {}).unwrap();
+    let dd = devstack::services::mysql_data_dir(&app, &v);
+    assert!(dd.ends_with("mysql-5.6") && dd.join("mysql/user.frm").exists() && dd.join("ibdata1").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn quick_add_menu_is_grouped_by_tool() {
+    use devstack::gui::menu::{count, quick_add_menu, Node};
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    let catalogue = devstack::packages::catalogue(&app);
+    let menu = quick_add_menu(&catalogue);
+    let groups: Vec<&str> = menu.iter().filter_map(|n| if let Node::Sub(l, _) = n { Some(l.as_str()) } else { None }).collect();
+    for g in ["PHP", "MySQL / MariaDB", "PostgreSQL", "Python", "Node.js"] {
+        assert!(groups.contains(&g), "{g} missing from {groups:?}");
+    }
+    assert_eq!(count(&menu) - groups.len(), catalogue.len(), "every package appears exactly once");
+    for id in ["php-7.0", "php-7.4", "python-3.8", "python-3.15", "mysql-5.6", "mysql-5.7", "mariadb-10.6", "postgresql-13", "nodejs-16", "composer-lts"] {
+        assert!(catalogue.iter().any(|p| p.id == id), "{id} missing from the catalogue");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn tools_without_an_exe_are_still_found() {
     use devstack::versions::candidates;
     assert_eq!(candidates("phpmyadmin"), ["index.php"]);

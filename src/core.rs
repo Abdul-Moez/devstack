@@ -41,7 +41,15 @@ pub struct App {
 
 impl App {
     pub fn new(root: Option<PathBuf>) -> Result<Self> {
-        let mut paths = Paths::new(root.unwrap_or_else(find_root));
+        // Config files need absolute paths, so a relative --root is resolved here.
+        let root = match root {
+            Some(r) => {
+                fs::create_dir_all(&r)?;
+                r.canonicalize().map(crate::paths::strip_verbatim).unwrap_or(r)
+            }
+            None => find_root(),
+        };
+        let mut paths = Paths::new(root);
         fs::create_dir_all(&paths.root)?;
         let settings = JsonStore::open(paths.settings_file.clone(), defaults())?;
         if !settings.exists() {
@@ -458,11 +466,16 @@ impl App {
             }
         }
         if IS_WIN {
-            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            let ok = Path::new(&root).join("System32").join("vcruntime140_1.dll").exists();
-            out.push((ok, if ok { "Visual C++ runtime installed".into() } else {
-                "Visual C++ runtime missing: install the latest x64 redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe".into()
-            }));
+            const VC_URL: &str = "https://aka.ms/vc14/vc_redist.x64.exe";
+            // Apache Lounge's current (VS2026 / VS18) builds need a 14.50+ runtime.
+            out.push(match winutil::vc_runtime_version() {
+                Some((14, minor, bld)) if minor >= 50 => (true, format!("Visual C++ runtime 14.{minor}.{bld} installed")),
+                Some((maj, minor, bld)) => (false, format!("Visual C++ runtime {maj}.{minor}.{bld} is too old for current Apache builds: update from {VC_URL}")),
+                None => (false, format!("Visual C++ runtime missing: install it from {VC_URL}")),
+            });
+            if let Some(msg) = self.active("mysql").and_then(|v| services::mysql_missing_runtime(&v)) {
+                out.push((false, msg));
+            }
         }
         if self.active("ngrok").is_some() {
             out.push((!self.secrets.str("ngrok_authtoken").is_empty(), "ngrok authtoken set".into()));

@@ -73,7 +73,12 @@ impl<'a> MySqlTools<'a> {
 
     pub fn change_root_password(&self, new: &str, log: Log) -> Result<()> {
         let esc = new.replace('\\', "\\\\").replace('\'', "\\'");
-        self.sql(&format!("ALTER USER 'root'@'localhost' IDENTIFIED BY '{esc}'; FLUSH PRIVILEGES;"))?;
+        if let Err(e) = self.sql(&format!("ALTER USER 'root'@'localhost' IDENTIFIED BY '{esc}'; FLUSH PRIVILEGES;")) {
+            // MySQL 5.6 has no ALTER USER ... IDENTIFIED BY.
+            if self.sql(&format!("SET PASSWORD FOR 'root'@'localhost' = PASSWORD('{esc}'); FLUSH PRIVILEGES;")).is_err() {
+                return Err(e);
+            }
+        }
         self.app.secrets.set("mysql_root_password", json!(new))?;
         self.app.generate(log)?;
         log("MySQL root password changed");

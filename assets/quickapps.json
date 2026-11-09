@@ -6,9 +6,17 @@
   {"name": "Laravel starter kit: React", "type": "composer", "package": "laravel/react-starter-kit"},
   {"name": "Laravel starter kit: Vue", "type": "composer", "package": "laravel/vue-starter-kit"},
   {"name": "Laravel starter kit: Livewire", "type": "composer", "package": "laravel/livewire-starter-kit"},
+  {"name": "Laravel 11 (PHP 8.2+)", "type": "composer", "package": "laravel/laravel:^11.0"},
+  {"name": "Laravel 10 (PHP 8.1+)", "type": "composer", "package": "laravel/laravel:^10.0"},
+  {"name": "Laravel 9 (PHP 8.0+)", "type": "composer", "package": "laravel/laravel:^9.0"},
+  {"name": "Laravel 8 (PHP 7.3+)", "type": "composer", "package": "laravel/laravel:^8.0"},
+  {"name": "Laravel 6 LTS (PHP 7.2+)", "type": "composer", "package": "laravel/laravel:^6.0"},
+  {"name": "Laravel 5.5 LTS (PHP 7.0+)", "type": "composer", "package": "laravel/laravel:5.5.*"},
   {"name": "Symfony", "type": "composer", "package": "symfony/skeleton"},
   {"name": "Symfony (webapp)", "type": "composer", "package": "symfony/website-skeleton"},
   {"name": "Drupal", "type": "composer", "package": "drupal/recommended-project"},
   {"name": "CodeIgniter 4", "type": "composer", "package": "codeigniter4/appstarter"},
-  {"name": "Slim", "type": "composer", "package": "slim/slim-skeleton"}
+  {"name": "Slim", "type": "composer", "package": "slim/slim-skeleton"},
+  {"name": "Django", "type": "python", "pip": ["django"], "commands": ["django-admin startproject config .", "python manage.py migrate"], "run": "python manage.py runserver 127.0.0.1:{port}", "django": true},
+  {"name": "Flask", "type": "python", "pip": ["flask"], "run": "flask --app app run --debug --port {port}", "flask": true}
 ]

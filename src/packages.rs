@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,9 @@ pub struct Package {
 pub struct Resolved {
     pub url: String,
     pub folder: String,
+    /// Published checksums (hex). Whichever is present is verified after the download.
     pub sha256: Option<String>,
+    pub sha512: Option<String>,
     pub filename: Option<String>,
 }
 
@@ -125,6 +128,20 @@ pub fn published_sha256(list_url: &str, file: &str) -> Result<String> {
         .ok_or_else(|| package_err(format!("No checksum for {file} in {list_url}.")))
 }
 
+pub fn sha512_of(path: &Path) -> Result<String> {
+    let mut f = fs::File::open(path)?;
+    let mut h = sha2::Sha512::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
 pub fn sha256_of(path: &Path) -> Result<String> {
     let mut f = fs::File::open(path)?;
     let mut h = Sha256::new();
@@ -174,8 +191,103 @@ pub fn php_releases() -> Result<(String, Value)> {
     Err(package_err(format!("Couldn't reach PHP for Windows downloads: {}", last.map(|e| format!("{e:#}")).unwrap_or_default())))
 }
 
+/// Newest build of an old PHP series from the archive folder (php.net no longer lists 7.0-7.3
+/// in releases.json). The archive publishes no checksums for these.
+fn php_archive(base: &str, series: &str, build: &str) -> Result<Resolved> {
+    let page = format!("{base}archives/");
+    let html = String::from_utf8_lossy(&http_get(&page, None)?).into_owned();
+    let (patch, file) = newest_php_archive(&html, series, build)
+        .ok_or_else(|| package_err(format!("No {build} x64 build of PHP {series} on windows.php.net.")))?;
+    Ok(Resolved {
+        url: format!("{page}{file}"),
+        folder: format!("php-{series}.{patch}-{build}"),
+        sha256: None,
+        sha512: None,
+        filename: None,
+    })
+}
+
+/// (patch, file name) of the newest x64 zip of `series` ("ts" or "nts") in the archive listing.
+/// File names look like php-7.1.33-Win32-VC14-x64.zip or php-7.4.33-nts-Win32-vc15-x64.zip.
+pub fn newest_php_archive(html: &str, series: &str, build: &str) -> Option<(u64, String)> {
+    let nts = if build == "nts" { "nts-" } else { "" };
+    let re = Regex::new(&format!(r"php-{}\.(\d+)-{nts}Win32-(?i:v[cs])\d+-x64\.zip", regex::escape(series))).ok()?;
+    re.captures_iter(html).filter_map(|c| Some((c[1].parse::<u64>().ok()?, c[0].to_string()))).max_by_key(|(patch, _)| *patch)
+}
+
+/// Python from the official NuGet package (python.org's release managers publish it). Unlike
+/// the "embeddable" zip it's a full Python with pip and venv. NuGet lists a SHA-512 per package.
+fn python_nuget(series: &str) -> Result<Resolved> {
+    let index = http_json("https://api.nuget.org/v3-flatcontainer/python/index.json")?;
+    let prefix = format!("{series}.");
+    let version = index["versions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|v| v.starts_with(&prefix) && !v.contains('-')) // no pre-releases
+        .max_by_key(|v| version_key(v))
+        .ok_or_else(|| package_err(format!("No Python {series} release on nuget.org.")))?
+        .to_string();
+    let reg = http_json(&format!("https://api.nuget.org/v3/registration5-semver1/python/{version}.json"))?;
+    let entry = http_json(s(&reg, "catalogEntry"))?;
+    if !s(&entry, "packageHashAlgorithm").eq_ignore_ascii_case("SHA512") {
+        return Err(package_err(format!("nuget.org lists no SHA-512 for Python {version}.")));
+    }
+    let hash = base64::engine::general_purpose::STANDARD
+        .decode(s(&entry, "packageHash"))
+        .map_err(|e| package_err(format!("Bad checksum for Python {version} on nuget.org: {e}")))?;
+    Ok(Resolved {
+        url: format!("https://api.nuget.org/v3-flatcontainer/python/{version}/python.{version}.nupkg"),
+        folder: format!("python-{version}"),
+        sha256: None,
+        sha512: Some(hex(&hash)),
+        filename: Some(format!("python-{version}.zip")),
+    })
+}
+
+/// Newest MariaDB release of a series, from MariaDB's download API (which lists a SHA-256).
+fn mariadb(series: &str) -> Result<Resolved> {
+    let data = http_json(&format!("https://downloads.mariadb.org/rest-api/mariadb/{series}/latest/"))?;
+    let releases = data["releases"].as_object().ok_or_else(|| package_err(format!("No MariaDB {series} release found.")))?;
+    let (version, rel) = releases
+        .iter()
+        .max_by_key(|(v, _)| version_key(v))
+        .ok_or_else(|| package_err(format!("No MariaDB {series} release found.")))?;
+    let want = format!("mariadb-{version}-winx64.zip");
+    let file = rel["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|f| s(f, "file_name") == want)
+        .ok_or_else(|| package_err(format!("MariaDB {version} has no Windows zip.")))?;
+    Ok(Resolved {
+        url: s(file, "file_download_url").replacen("http://", "https://", 1),
+        folder: format!("mariadb-{version}"),
+        sha256: file["checksum"].get("sha256sum").and_then(Value::as_str).map(str::to_string),
+        sha512: None,
+        filename: Some(want),
+    })
+}
+
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// The first URL that answers a HEAD request with success.
+fn first_available(urls: &[&str]) -> Option<String> {
+    urls.iter()
+        .find(|u| client().head(**u).send().is_ok_and(|r| r.status().is_success()))
+        .map(|u| (*u).to_string())
+}
+
+/// "series" as a string, whether the catalogue wrote "3.12" or 3.12.
+fn series_of(src: &Value) -> String {
+    match src.get("series") {
+        Some(Value::String(x)) => x.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 fn url_file(url: &str) -> String {
@@ -192,10 +304,13 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
             if series == "latest" {
                 series = data.as_object().and_then(|o| o.keys().max_by_key(|k| version_key(k)).cloned()).unwrap_or_default();
             }
-            let rel = data.get(&series).ok_or_else(|| package_err(format!("PHP {series} is not on windows.php.net any more (end of life?).")))?;
             let build = app.settings.str("php.build");
-            let build = if build.is_empty() { "ts".to_string() } else { build };
-            let re = Regex::new(&format!(r"^{build}-vs\d+-x64$")).unwrap();
+            let build = if build == "nts" { build } else { "ts".to_string() };
+            let Some(rel) = data.get(&series) else {
+                return php_archive(&base, &series, &build); // 7.0-7.3: only in the archive folder
+            };
+            // Keys look like "ts-vs16-x64" (PHP 8) or "ts-vc15-x64" (PHP 7.4).
+            let re = Regex::new(&format!(r"^{build}-v[cs]\d+-x64$")).unwrap();
             let mut keys: Vec<&String> = rel.as_object().map(|o| o.keys().collect()).unwrap_or_default();
             keys.sort();
             keys.reverse();
@@ -205,6 +320,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                 url: format!("{base}{}", s(zip, "path")),
                 folder: format!("php-{}-{build}", s(rel, "version")),
                 sha256: zip.get("sha256").and_then(Value::as_str).map(str::to_string),
+                sha512: None,
                 filename: None,
             })
         }
@@ -221,6 +337,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                         url: format!("https://nodejs.org/dist/{v}/{file}"),
                         folder: format!("node-{}", v.trim_start_matches('v')),
                         sha256: Some(published_sha256(&format!("https://nodejs.org/dist/{v}/SHASUMS256.txt"), &file)?),
+                        sha512: None,
                         filename: None,
                     });
                 }
@@ -242,6 +359,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                         url: s(a, "browser_download_url").to_string(),
                         folder: format!("{tool}-{version}"),
                         sha256: digest.strip_prefix("sha256:").map(str::to_string),
+                        sha512: None,
                         filename: Some(name.to_string()),
                     });
                 }
@@ -250,17 +368,27 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
             Err(package_err(format!("No asset matching {} in {repo} {tag}. Assets: {}. Fix the regex in usr/packages.json.", s(src, "asset"), names.join(", "))))
         }
         "composer" => {
+            // {"lts": true} picks Composer 2.2 LTS, the last one that runs on PHP < 7.2.5.
             let v = http_json("https://getcomposer.org/versions")?;
-            let stable = &v["stable"][0];
+            let want_lts = src.get("lts").and_then(Value::as_bool).unwrap_or(false);
+            let stable = v["stable"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| !want_lts || e["lts"].as_bool().unwrap_or(false))
+                .ok_or_else(|| package_err("No matching Composer release on getcomposer.org."))?;
             let version = s(stable, "version");
             let sums = format!("https://getcomposer.org/download/{version}/composer.phar.sha256sum");
             Ok(Resolved {
                 url: format!("https://getcomposer.org{}", s(stable, "path")),
                 folder: format!("composer-{version}"),
                 sha256: Some(published_sha256(&sums, "composer.phar")?),
+                sha512: None,
                 filename: Some("composer.phar".into()),
             })
         }
+        "python" => python_nuget(&series_of(src)),
+        "mariadb" => mariadb(&series_of(src)),
         "go" => {
             let rels = http_json("https://go.dev/dl/?mode=json")?;
             for r in rels.as_array().into_iter().flatten().filter(|r| r["stable"].as_bool().unwrap_or(false)) {
@@ -270,6 +398,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                             url: format!("https://go.dev/dl/{}", s(f, "filename")),
                             folder: s(r, "version").replacen("go", "go-", 1),
                             sha256: f.get("sha256").and_then(Value::as_str).map(str::to_string),
+                            sha512: None,
                             filename: Some(s(f, "filename").to_string()),
                         });
                     }
@@ -283,6 +412,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                     url: "https://files.phpmyadmin.net/snapshots/phpMyAdmin-6.0+snapshot-all-languages.zip".into(),
                     folder: "phpmyadmin-6.0-snapshot".into(),
                     sha256: None,
+                    sha512: None,
                     filename: Some("phpMyAdmin-6.0-snapshot.zip".into()),
                 });
             }
@@ -292,6 +422,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
             let url = format!("https://files.phpmyadmin.net/phpMyAdmin/{ver}/{file}");
             Ok(Resolved {
                 sha256: Some(published_sha256(&format!("{url}.sha256"), &file)?),
+                sha512: None,
                 url,
                 folder: format!("phpmyadmin-{ver}"),
                 filename: None,
@@ -307,6 +438,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                         url: format!("https://get.enterprisedb.com/postgresql/postgresql-{v}-1-windows-x64-binaries.zip"),
                         folder: format!("postgresql-{v}"),
                         sha256: None,
+                        sha512: None,
                         filename: None,
                     });
                 }
@@ -327,6 +459,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                             url: url.to_string(),
                             folder: format!("mongodb-{}", s(ver, "version")),
                             sha256: d["archive"].get("sha256").and_then(Value::as_str).map(str::to_string),
+                            sha512: None,
                             filename: None,
                         });
                     }
@@ -368,15 +501,23 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
                 let version = parse_version(&url_file(&url)).unwrap_or_else(|| "latest".into());
                 (url, version)
             };
-            Ok(Resolved { url, folder: format!("{tool}-{version}"), sha256: None, filename: None })
+            Ok(Resolved { url, folder: format!("{tool}-{version}"), sha256: None, sha512: None, filename: None })
         }
         "url" => {
-            let url = s(src, "url").to_string();
+            // "urls": the same file at several addresses, first one that exists wins (MySQL
+            // moves a release from Downloads/ to archives/ once the next one is out).
+            let url = match src.get("urls").and_then(Value::as_array) {
+                Some(list) => {
+                    let list: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+                    first_available(&list).ok_or_else(|| package_err(format!("None of these addresses answer: {}", list.join(", "))))?
+                }
+                None => s(src, "url").to_string(),
+            };
             let folder = match s(src, "folder") {
                 "" => format!("{tool}-{}", parse_version(&url_file(&url)).unwrap_or_else(|| "latest".into())),
                 f => f.to_string(),
             };
-            Ok(Resolved { sha256: src.get("sha256").and_then(Value::as_str).map(str::to_string), url, folder, filename: None })
+            Ok(Resolved { sha256: src.get("sha256").and_then(Value::as_str).map(str::to_string), sha512: None, url, folder, filename: None })
         }
         other => Err(package_err(format!("Unknown source type '{other}'."))),
     }
@@ -455,13 +596,14 @@ pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
             }
         }
     })?;
-    if let Some(expected) = &r.sha256 {
-        let got = sha256_of(&file)?;
+    for (expected, algo) in [(&r.sha256, "SHA-256"), (&r.sha512, "SHA-512")] {
+        let Some(expected) = expected else { continue };
+        let got = if algo == "SHA-256" { sha256_of(&file)? } else { sha512_of(&file)? };
         if !got.eq_ignore_ascii_case(expected) {
             let _ = fs::remove_file(&file);
-            return Err(package_err(format!("Checksum mismatch for {name} (expected {expected}, got {got}). Download discarded.")));
+            return Err(package_err(format!("{algo} mismatch for {name} (expected {expected}, got {got}). Download discarded.")));
         }
-        log("  checksum verified");
+        log(&format!("  {algo} checksum verified"));
     }
     if name.ends_with(".phar") {
         fs::create_dir_all(&target)?;
@@ -486,6 +628,15 @@ pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
     fs::rename(&found, &target).with_context(|| format!("moving into {}", target.display()))?;
     let _ = fs::remove_dir_all(&ex);
     let _ = fs::remove_file(&file);
+    if item.tool == "python" {
+        // The NuGet build has pip but no pip.exe; Scripts\ is on PATH (and where pip puts
+        // the commands of packages it installs).
+        let scripts = target.join("Scripts");
+        fs::create_dir_all(&scripts)?;
+        for name in ["pip.cmd", "pip3.cmd"] {
+            fs::write(scripts.join(name), "@\"%~dp0..\\python.exe\" -m pip %*\r\n")?;
+        }
+    }
     pin_version(app, &item.tool, before, &r.folder)?;
     log(&format!("Installed {} {} → {}", item.tool, r.folder, target.display()));
     Ok(target)

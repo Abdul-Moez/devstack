@@ -85,6 +85,42 @@ fn version_menu(app: &App, tool: &str) -> Vec<Node> {
     out
 }
 
+fn tool_label(tool: &str) -> String {
+    match tool {
+        "php" => "PHP".into(),
+        "mysql" => "MySQL / MariaDB".into(),
+        "postgresql" => "PostgreSQL".into(),
+        "mongodb" => "MongoDB".into(),
+        "nodejs" => "Node.js".into(),
+        "phpmyadmin" => "phpMyAdmin".into(),
+        other => {
+            let mut c = other.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        }
+    }
+}
+
+/// Quick add grouped by tool (in catalogue order); tools with a single entry stay top-level.
+pub fn quick_add_menu(catalogue: &[packages::Package]) -> Vec<Node> {
+    let mut tools: Vec<&str> = vec![];
+    for pk in catalogue {
+        if !tools.contains(&pk.tool.as_str()) {
+            tools.push(&pk.tool);
+        }
+    }
+    let mut out = vec![];
+    for tool in tools {
+        let mut entries: Vec<Node> =
+            catalogue.iter().filter(|pk| pk.tool == tool).map(|pk| item(pk.label.clone(), Action::QuickAdd(pk.id.clone()))).collect();
+        if entries.len() == 1 {
+            out.append(&mut entries);
+        } else {
+            out.push(Node::Sub(tool_label(tool), entries));
+        }
+    }
+    out
+}
+
 pub fn model(app: &App) -> Vec<Node> {
     let p = app.paths();
     let sites = app.sites();
@@ -167,7 +203,7 @@ pub fn model(app: &App) -> Vec<Node> {
         others.push(Node::Disabled("(nothing else installed)".into()));
     }
 
-    let mut qadd: Vec<Node> = packages::catalogue(app).into_iter().map(|pk| item(pk.label, Action::QuickAdd(pk.id))).collect();
+    let mut qadd = quick_add_menu(&packages::catalogue(app));
     qadd.extend([Node::Sep, item("Edit package list (usr/packages.json)", Action::Edit(p.usr.join("packages.json")))]);
     let tools = vec![
         Node::Sub("Quick add".into(), qadd),

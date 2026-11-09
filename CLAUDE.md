@@ -26,9 +26,13 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
    is current and works while the window is hidden), closing the window hides to the tray,
    single instance (second launch focuses the first), Tools > PATH add/remove, Run at startup,
    Terminal button, `bin/current/*` junctions, Share (needs an ngrok token).
-6. Check every Quick add entry actually downloads (`ds packages`, then `ds add <id>`). The
-   sources' formats were checked against current pages, but the sandbox couldn't download.
-   Fix entries in `assets/packages.json`. Least certain: `memcached`, `apache` (scraper).
+6. `ds resolve` (hidden) looks up every Quick add entry without downloading and prints URL,
+   folder and checksum type; all 63 resolved on 2026-11-09. Installed for real so far:
+   composer, composer-lts, phpmyadmin, python-3.12, php-7.1. Still to try: the big ones
+   (Apache, MySQL, MariaDB, PostgreSQL, MongoDB) and actually starting them.
+   **MySQL entries are pinned versions** (`"urls"` = Downloads/ then archives/ on
+   cdn.mysql.com): dev.mysql.com answers devstack's client with 403, so it can't be scraped.
+   Bump the versions in `assets/packages.json` when MySQL releases.
 7. `scripts\build-installer.ps1` → `dist\devstack-setup-<version>.exe`. Test it in Windows
    Sandbox: install to C:\devstack with the Recommended set, run, uninstall.
 
@@ -39,13 +43,13 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 | `src/core.rs` | `App`: start_all / stop_all / reload / switch_version / set_web_server / set_ssl / PATH / doctor. The CLI and GUI only call this. |
 | `src/services.rs` | `Service` trait (default methods do port checks, spawn, health check, stop) + one struct per program: Apache, Nginx, Php (php-cgi pool), MySql, Postgres, Mongo, Redis, Memcached, Mailpit. |
 | `src/configs.rs` | Renders `assets/templates/*.j2` (minijinja) into `etc/` (php.ini into the PHP folder). Returns which services' configs changed. |
-| `src/sites.rs` | Each folder in `www/` → a site (`{name}.test`, `public/` docroot if present, `usr/sites.json` overrides). |
+| `src/sites.rs` | Each folder in `www/` → a site (`{name}.test`, `public/` docroot if present, `usr/sites.json` overrides; `"proxy": <port>` forwards the site to an app server). |
 | `src/hosts.rs` | Owns one marked block in the hosts file; writes through a UAC helper only when it changed. |
 | `src/ssl.rs` | Local CA + per-site certs (rcgen), trust via `certutil -user`. |
-| `src/packages.rs` | Quick add: resolvers (php, node, github, scrape, …) → download → SHA-256 → extract to `bin/<tool>/<folder>/`. |
+| `src/packages.rs` | Quick add: resolvers → download → checksum → extract to `bin/<tool>/<folder>/`. Sources: php (releases.json, archive folder for 7.0-7.3), python (official NuGet package, SHA-512), mariadb (REST API, SHA-256), node, composer (`lts` = 2.2), github, go, phpmyadmin, postgresql, mongodb, scrape, url (`urls` = mirrors). |
 | `src/updates.rs` | Daily: newest PHP patch per installed series, cacert.pem refresh. |
 | `src/database.rs` | MySQL tools (create db, root password, backups, recover/restore), PostgreSQL backup, scheduled backups. |
-| `src/quickapp.rs` | Quick app recipes (`usr/quickapps.json`): blank, zip, composer, command. |
+| `src/quickapp.rs` | Quick app recipes (built-in list merged with `usr/quickapps.json`): blank, zip, composer, command, python (.venv + pip + commands, proxy site on a free port 8001+, `run.bat`, dev server opened in a console). Composer 2.2 LTS is picked automatically for PHP < 7.2.5. |
 | `src/share.rs` | ngrok tunnel and its public URL. |
 | `src/winutil.rs` | **All Win32 code**: UAC elevation, user PATH, autostart, junctions, show/hide window, single instance, terminals. |
 | `src/procs.rs` | Detached spawning, PID + start-time tracking in `tmp/state.json`, port owners (netstat2/sysinfo). |
@@ -87,6 +91,16 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
     version that was active before (`versions.<tool>`); only `switch_version` changes it.
 13. Secrets stay off command lines (ngrok gets `NGROK_AUTHTOKEN`, MySQL tools read
     `etc/mysql/client.cnf`).
+
+## Old versions
+
+* PHP 7.0/7.1 need `extension=php_x.dll` (configs pass `php_ext_dll`); 7.0 gets
+  `serialize_precision = 17`. mbstring is loaded before exif.
+* MySQL 5.6 has no `--initialize`: the data folder is copied from the zip's `data/`. It links
+  the Visual C++ 2010 runtime (`services::mysql_missing_runtime` checks before starting);
+  5.7+ use the current runtime. Password changes fall back to `SET PASSWORD` on 5.6.
+* Apache Lounge builds are now VS18 (Visual Studio 2026) and want a 14.50+ VC++ runtime;
+  the installer and `ds doctor` check the version, not just presence.
 
 ## How PHP is wired (and why)
 

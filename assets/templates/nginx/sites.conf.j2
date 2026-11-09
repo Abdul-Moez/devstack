@@ -56,6 +56,22 @@ server {
 {% endif %}
     server_name {{ s.host }} *.{{ s.host }}{% for a in s.aliases %} {{ a }}{% endfor %};
     root "{{ s.docroot }}";
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+{% if s.proxy %}
+
+    # Requests go to the app server set as "proxy" in usr/sites.json.
+    location / {
+        proxy_pass {{ s.proxy }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300;
+    }
+{% else %}
     index index.php index.html index.htm;
     autoindex on;
 
@@ -67,9 +83,6 @@ server {
         try_files $uri =404;
 {{ php_block("$document_root$fastcgi_script_name") }}
     }
-
-    location ~ /\.(?!well-known) {
-        deny all;
-    }
+{% endif %}
 }
 {% endfor %}

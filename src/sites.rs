@@ -2,6 +2,8 @@
 //!
 //! Per-site overrides go in usr/sites.json, for example:
 //! `{"blog": {"docroot": "web", "aliases": ["blog.local"], "ssl": false}, "old": {"disabled": true}}`
+//! `{"api": {"proxy": 8001}}` sends https://api.test to an app server on 127.0.0.1:8001
+//! (Django, Flask, Node, ...) instead of serving files.
 
 use std::fs;
 use std::path::PathBuf;
@@ -23,6 +25,19 @@ pub struct Site {
     pub ssl: bool,
     pub cert: String,
     pub key: String,
+    /// Local port of an app server the web server forwards requests to.
+    pub proxy: Option<u16>,
+}
+
+/// A proxy target from usr/sites.json: only a port number (8001 or "8001") is accepted, so
+/// nothing but 127.0.0.1:<port> can end up in the web server config.
+pub fn proxy_port(v: Option<&Value>) -> Option<u16> {
+    let n = match v? {
+        Value::Number(n) => n.as_u64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    u16::try_from(n).ok().filter(|p| *p != 0)
 }
 
 impl Site {
@@ -87,7 +102,8 @@ pub fn discover(app: &App) -> Vec<Site> {
             .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_lowercase)).filter(|x| valid_host(x)).collect())
             .unwrap_or_default();
         let ssl = o.get("ssl").and_then(Value::as_bool).unwrap_or(ssl_default) && ssl_default;
-        sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new() });
+        let proxy = proxy_port(o.get("proxy"));
+        sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new(), proxy });
     }
     sites
 }

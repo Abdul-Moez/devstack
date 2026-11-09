@@ -90,6 +90,10 @@ enum Cmd {
     },
     #[command(name = "_elevated", hide = true)]
     Elevated { task: String, arg: String },
+    /// Show what Quick add entries resolve to (URL, folder, checksum) without downloading.
+    /// No ids = every entry.
+    #[command(hide = true)]
+    Resolve { ids: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -359,6 +363,27 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
             _ => return Err(anyhow!("Use: ds autostart on | ds autostart off")),
         },
         Cmd::Setup { packages: ids, pause_on_error } => return setup(app, &ids, pause_on_error),
+        Cmd::Resolve { ids } => {
+            let all = packages::catalogue(app);
+            let mut bad = 0;
+            for p in all.iter().filter(|p| ids.is_empty() || ids.contains(&p.id)) {
+                match packages::resolve(app, p) {
+                    Ok(r) => {
+                        let sum = match (&r.sha256, &r.sha512) {
+                            (Some(_), _) => "sha256",
+                            (_, Some(_)) => "sha512",
+                            _ => "no checksum",
+                        };
+                        log(&format!("  ok  {:<18} {:<26} {sum:<11} {}", p.id, r.folder, r.url));
+                    }
+                    Err(e) => {
+                        bad += 1;
+                        log(&format!("  !!  {:<18} {e:#}", p.id));
+                    }
+                }
+            }
+            return Ok(i32::from(bad > 0));
+        }
     }
     Ok(0)
 }

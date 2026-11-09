@@ -9,7 +9,7 @@ precision = 14
 output_buffering = 4096
 zlib.output_compression = Off
 implicit_flush = Off
-serialize_precision = -1
+serialize_precision = {{ -1 if php_modern_precision else 17 }}
 expose_php = Off
 max_execution_time = {{ php.max_execution_time }}
 max_input_time = 120
@@ -41,10 +41,10 @@ default_socket_timeout = 60
 sys_temp_dir = "{{ tmp }}/php"
 
 {% for e in php_extensions %}
-extension={{ e }}
+extension={{ "php_" ~ e ~ ".dll" if php_ext_dll else e }}
 {% endfor %}
 {% for z in php_zend_extensions %}
-zend_extension={{ z }}
+zend_extension={{ "php_" ~ z ~ ".dll" if php_ext_dll else z }}
 {% endfor %}
 
 [Date]

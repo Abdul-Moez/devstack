@@ -515,6 +515,19 @@ pub fn mysql_is_mariadb(v: &Version) -> bool {
     v.path.join("bin").join(exe("mariadb-install-db")).exists() || v.path.join("bin").join(exe("mariadbd")).exists()
 }
 
+pub const VC2010_URL: &str = "https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x64.exe";
+
+/// MySQL 5.6 builds link against the Visual C++ 2010 runtime (newer ones use the current
+/// one). Without it mysqld dies with a "MSVCR100.dll not found" popup; say so up front.
+pub fn mysql_missing_runtime(v: &Version) -> Option<String> {
+    if !IS_WIN || mysql_is_mariadb(v) || v.key() >= vec![5, 7] {
+        return None;
+    }
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let present = PathBuf::from(root).join("System32").join("msvcr100.dll").exists();
+    (!present).then(|| format!("{} needs the Visual C++ 2010 runtime (x64). Install it from {VC2010_URL}", v.name))
+}
+
 pub fn mysql_data_dir(app: &App, v: &Version) -> PathBuf {
     let prefix = if mysql_is_mariadb(v) { "mariadb" } else { "mysql" };
     app.paths.data.join(format!("{prefix}-{}", v.series()))
@@ -554,6 +567,9 @@ impl Service for MySql {
         vec![app.settings.port("mysql")]
     }
     fn prepare(&self, app: &App, v: &Version, log: Log) -> Result<()> {
+        if let Some(msg) = mysql_missing_runtime(v) {
+            return Err(service_err(msg));
+        }
         fs::create_dir_all(app.paths.tmp.join("mysql"))?;
         let dd = mysql_data_dir(app, v);
         if dd.exists() {
@@ -561,6 +577,17 @@ impl Service for MySql {
         }
         log(&format!("Initializing {} {} data folder (first run, can take a minute)…", self.name(), v.series()));
         fs::create_dir_all(dd.parent().unwrap())?;
+        if !mysql_is_mariadb(v) && v.key() < vec![5, 7] {
+            // MySQL 5.6 and older have no --initialize; the zip ships a ready data folder.
+            let template = v.path.join("data");
+            if !template.join("mysql").is_dir() {
+                return Err(service_err(format!("{} has no data folder to start from.", v.name)));
+            }
+            crate::util::copy_dir(&template, &dd).inspect_err(|_| {
+                let _ = fs::remove_dir_all(&dd);
+            })?;
+            return Ok(());
+        }
         let c = if mysql_is_mariadb(v) {
             command(mysql_bin(v, &["mariadb-install-db", "mysql_install_db"]), [format!("--datadir={}", dd.display())])
         } else {
