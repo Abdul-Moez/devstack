@@ -1,0 +1,7 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    { "name": "Debug devstack (GUI)", "type": "lldb", "request": "launch", "cargo": { "args": ["build", "--bin=devstack"] }, "cwd": "${workspaceFolder}" },
+    { "name": "Debug ds status", "type": "lldb", "request": "launch", "cargo": { "args": ["build", "--bin=ds"] }, "args": ["status"], "cwd": "${workspaceFolder}" }
+  ]
+}
