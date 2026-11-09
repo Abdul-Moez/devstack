@@ -77,7 +77,7 @@ pub fn http_get(url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
 }
 
 pub fn http_json(url: &str) -> Result<Value> {
-    Ok(serde_json::from_slice(&http_get(url, None)?).with_context(|| format!("{url} did not return JSON"))?)
+    serde_json::from_slice(&http_get(url, None)?).with_context(|| format!("{url} did not return JSON"))
 }
 
 pub fn download(url: &str, dest: &Path, referer: Option<&str>, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {

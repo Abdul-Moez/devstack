@@ -75,6 +75,17 @@ enum Cmd {
     Doctor,
     /// Open a terminal with devstack tools on PATH.
     Terminal,
+    /// Run devstack when Windows starts: on | off
+    Autostart { action: String },
+    /// First-time setup (used by the installer): download packages and enable their services.
+    Setup {
+        /// Quick add ids, comma separated (e.g. php-8.4,apache,mysql-8.4,mailpit)
+        #[arg(long, value_delimiter = ',')]
+        packages: Vec<String>,
+        /// Wait for Enter before closing if something failed.
+        #[arg(long)]
+        pause_on_error: bool,
+    },
     #[command(name = "_elevated", hide = true)]
     Elevated { task: String, arg: String },
 }
@@ -326,6 +337,55 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
             return Ok(if bad > 0 { 1 } else { 0 });
         }
         Cmd::Terminal => app.open_terminal()?,
+        Cmd::Autostart { action } => match action.as_str() {
+            "on" | "off" => {
+                app.set_autostart(action == "on")?;
+                log(&format!("Run at Windows startup: {action}"));
+            }
+            _ => return Err(anyhow!("Use: ds autostart on | ds autostart off")),
+        },
+        Cmd::Setup { packages: ids, pause_on_error } => return setup(app, &ids, pause_on_error),
     }
     Ok(0)
+}
+
+/// Download the chosen packages, enable the services they belong to, pick the web server.
+fn setup(app: &App, ids: &[String], pause_on_error: bool) -> Result<i32> {
+    let mut failed = vec![];
+    let mut tools = vec![];
+    for id in ids.iter().filter(|i| !i.trim().is_empty()) {
+        log(&format!("\n=== {id}"));
+        match packages::find(app, id).and_then(|p| {
+            packages::install(app, &p, &log)?;
+            Ok(p.tool)
+        }) {
+            Ok(tool) => tools.push(tool),
+            Err(e) => {
+                log(&format!("FAILED: {e:#}"));
+                failed.push(id.clone());
+            }
+        }
+    }
+    for s in app.services() {
+        if tools.iter().any(|t| t == s.tool()) && !matches!(s.id(), "apache" | "nginx" | "php") {
+            s.set_enabled(app, true)?;
+        }
+    }
+    let has = |t: &str| tools.iter().any(|x| x == t);
+    if has("nginx") && !has("apache") {
+        app.settings.set("web_server", serde_json::json!("nginx"))?;
+    } else if has("apache") {
+        app.settings.set("web_server", serde_json::json!("apache"))?;
+    }
+    app.generate(&log)?;
+    if failed.is_empty() {
+        log("\nAll done. Open devstack and click Start All.");
+        Ok(0)
+    } else {
+        log(&format!("\nThese couldn't be downloaded: {}. You can add them later from Menu > Tools > Quick add.", failed.join(", ")));
+        if pause_on_error {
+            confirm("Press Enter to close");
+        }
+        Ok(1)
+    }
 }

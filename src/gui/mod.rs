@@ -564,7 +564,11 @@ impl GuiApp {
                     "in Apache" if apache_up => GREEN,
                     _ => GREY,
                 };
-                ui.label(RichText::new(format!("● {}", r.status)).color(color));
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.5, color);
+                    ui.label(RichText::new(&r.status).color(color));
+                });
                 let up = r.status == "running" || r.status == "degraded";
                 let can = r.installed && (up || r.enabled) && r.id != "php" || (r.id == "php" && up);
                 if ui.add_enabled(can && !self.busy(), egui::Button::new(if up { "Stop" } else { "Start" }).min_size(egui::vec2(64.0, 0.0))).clicked() {
