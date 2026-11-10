@@ -71,7 +71,15 @@ enum Cmd {
     Ssl { action: String },
     /// Let other devices on your network open your sites: on | off (default off)
     Lan { action: String },
-    /// Check for PHP updates and refresh cacert.pem now.
+    /// Projects with their own versions.
+    ///   ds project                          show the chosen project and every project's versions
+    ///   ds project use <name> | none        switch to a project's versions (none = defaults)
+    ///   ds project set <name> <tool> <version|default>   e.g. ds project set shop php php-7.4.33-ts
+    #[command(verbatim_doc_comment)]
+    Project { action: Option<String>, name: Option<String>, tool: Option<String>, version: Option<String> },
+    /// Look for new versions of every tool (and new Laravel majors) now.
+    Discover,
+    /// Check for updates now: new versions, PHP patches, cacert.pem.
     Update,
     /// Check the setup.
     Doctor,
@@ -198,7 +206,48 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
             if let Some(r) = share::running(app) {
                 log(&format!("  sharing {} at {}", r.site.unwrap_or_default(), r.url.unwrap_or_default()));
             }
+            log(&format!("  project: {}", app.project().unwrap_or_else(|| "none (default versions)".into())));
         }
+        Cmd::Discover => {
+            let n = packages::discover(app, &log)?;
+            log(&if n == 0 { "No new versions since the last check.".to_string() } else { format!("{n} new version(s) added; see ds packages.") });
+        }
+        Cmd::Project { action, name, tool, version } => match action.as_deref() {
+            None => {
+                log(&format!("Chosen: {}", app.project().unwrap_or_else(|| "none (default versions)".into())));
+                for s in app.sites() {
+                    let v = if s.versions.is_empty() {
+                        "default versions".to_string()
+                    } else {
+                        s.versions.iter().map(|(t, v)| format!("{t} {v}")).collect::<Vec<_>>().join(", ")
+                    };
+                    log(&format!("  {:<24} {v}", s.name));
+                }
+            }
+            Some("use") => {
+                let n = name.ok_or_else(|| anyhow!("Which project? ds project use <name> | none"))?;
+                app.set_project(if matches!(n.as_str(), "none" | "default") { None } else { Some(n.as_str()) }, &log)?;
+            }
+            Some("set") => {
+                let (Some(n), Some(t), Some(v)) = (name, tool, version) else {
+                    return Err(anyhow!("Use: ds project set <name> <tool> <version|default>"));
+                };
+                if !crate::core::PROJECT_TOOLS.contains(&t.as_str()) {
+                    return Err(anyhow!("Projects can set: {}", crate::core::PROJECT_TOOLS.join(", ")));
+                }
+                let site = app.sites().into_iter().find(|s| s.name == n).ok_or_else(|| anyhow!("No project called {n} in www."))?;
+                let mut versions = site.versions;
+                if v == "default" {
+                    versions.remove(&t);
+                } else if app.versions(&t).iter().any(|x| x.name == v) {
+                    versions.insert(t, v);
+                } else {
+                    return Err(anyhow!("{v} isn't installed. Run 'ds versions {t}'."));
+                }
+                app.save_project_versions(&n, &versions, &log)?;
+            }
+            Some(other) => return Err(anyhow!("Unknown action '{other}'. Use: ds project | use | set")),
+        },
         Cmd::Sites => {
             for s in app.sites() {
                 log(&format!("  {:<40} {}", s.url(), s.docroot.display()));
@@ -421,7 +470,7 @@ fn setup(app: &App, ids: &[String], pause_on_error: bool) -> Result<i32> {
         log("\nAll done. Open devstack and click Start All.");
         Ok(0)
     } else {
-        log(&format!("\nThese couldn't be downloaded: {}. You can add them later from Menu > Tools > Quick add.", failed.join(", ")));
+        log(&format!("\nThese couldn't be downloaded: {}. You can add them later on the Install page.", failed.join(", ")));
         if pause_on_error {
             confirm("Press Enter to close");
         }

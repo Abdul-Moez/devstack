@@ -4,16 +4,20 @@
 //! `{"blog": {"docroot": "web", "aliases": ["blog.local"], "ssl": false}, "old": {"disabled": true}}`
 //! `{"api": {"proxy": 8001}}` sends https://api.test to an app server on 127.0.0.1:8001
 //! (Django, Flask, Node, ...) instead of serving files.
+//! `{"shop": {"versions": {"php": "php-7.4.33-ts", "mysql": "mysql-5.7.44"}}}` makes shop a
+//! project with its own versions: choosing it switches to them (see `App::set_project`).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use anyhow::{anyhow, Result};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::core::App;
-use crate::util::load_json;
+use crate::core::{App, PROJECT_TOOLS};
+use crate::util::{load_json, safe_file_name, write_if_changed};
 
 #[derive(Clone, Debug)]
 pub struct Site {
@@ -27,6 +31,8 @@ pub struct Site {
     pub key: String,
     /// Local port of an app server the web server forwards requests to.
     pub proxy: Option<u16>,
+    /// Versions this project uses (tool -> version folder), e.g. php -> php-7.4.33-ts.
+    pub versions: BTreeMap<String, String>,
 }
 
 /// A proxy target from usr/sites.json: only a port number (8001 or "8001") is accepted, so
@@ -44,6 +50,73 @@ impl Site {
     pub fn url(&self) -> String {
         format!("{}://{}", if self.ssl { "https" } else { "http" }, self.host)
     }
+
+    /// What the project is built with, judged from its files.
+    pub fn stack(&self) -> Vec<&'static str> {
+        let has = |f: &str| self.path.join(f).exists();
+        let mut out = vec![];
+        if has("composer.json") || has("index.php") || has("artisan") || has("wp-config.php") || has("public/index.php") {
+            out.push("PHP");
+        }
+        if has("package.json") {
+            out.push("Node");
+        }
+        if has("manage.py") || has("requirements.txt") || has("pyproject.toml") || has(".venv") || has("app.py") {
+            out.push("Python");
+        }
+        out
+    }
+}
+
+/// Versions from a usr/sites.json entry: only known tools and plain folder names.
+fn parse_versions(v: Option<&Value>) -> BTreeMap<String, String> {
+    v.and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(tool, _)| PROJECT_TOOLS.contains(&tool.as_str()))
+                .filter_map(|(tool, name)| name.as_str().filter(|n| safe_file_name(n)).map(|n| (tool.clone(), n.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Change one site's entry in usr/sites.json, keeping everything else in the file. An entry
+/// left empty is removed.
+pub fn update_override(app: &App, name: &str, change: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Result<()> {
+    let path = app.paths().usr.join("sites.json");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut all: Value = if text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&text).map_err(|e| anyhow!("usr/sites.json isn't valid JSON ({e}); fix it first."))?
+    };
+    let obj = all.as_object_mut().ok_or_else(|| anyhow!("usr/sites.json should contain a JSON object."))?;
+    let entry = obj.entry(name.to_string()).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    change(entry.as_object_mut().expect("just made it an object"));
+    if entry.as_object().is_some_and(serde_json::Map::is_empty) {
+        obj.remove(name);
+    }
+    write_if_changed(&path, &(serde_json::to_string_pretty(&all)? + "\n"))?;
+    Ok(())
+}
+
+/// Save a project's versions (an empty map makes it use the defaults again).
+pub fn set_versions(app: &App, name: &str, versions: &BTreeMap<String, String>) -> Result<()> {
+    for (tool, v) in versions {
+        if !PROJECT_TOOLS.contains(&tool.as_str()) || !safe_file_name(v) {
+            return Err(anyhow!("{tool} = {v} isn't a version devstack can use."));
+        }
+    }
+    update_override(app, name, |e| {
+        if versions.is_empty() {
+            e.remove("versions");
+        } else {
+            e.insert("versions".into(), json!(versions));
+        }
+    })
 }
 
 pub fn host_for(name: &str, template: &str) -> String {
@@ -103,7 +176,8 @@ pub fn discover(app: &App) -> Vec<Site> {
             .unwrap_or_default();
         let ssl = o.get("ssl").and_then(Value::as_bool).unwrap_or(ssl_default) && ssl_default;
         let proxy = proxy_port(o.get("proxy"));
-        sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new(), proxy });
+        let versions = parse_versions(o.get("versions"));
+        sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new(), proxy, versions });
     }
     sites
 }

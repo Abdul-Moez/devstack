@@ -157,8 +157,19 @@ pub fn sha256_of(path: &Path) -> Result<String> {
 }
 
 // ------------------------------------------------------------------ catalogue
+/// Built-in entries, then series found by `discover` (cached in tmp/discovered.json), then
+/// usr/packages.json (an entry with the same id replaces the built-in one).
 pub fn catalogue(app: &App) -> Vec<Package> {
     let mut items: Vec<Package> = serde_json::from_str(assets::PACKAGES_JSON).unwrap_or_default();
+    let found: Vec<Package> = load_json(&discovered_path(app))
+        .and_then(|v| serde_json::from_value(v["packages"].clone()).ok())
+        .unwrap_or_default();
+    for p in found {
+        if !items.iter().any(|i| i.id == p.id) {
+            let at = insert_position(&items, &p);
+            items.insert(at, p);
+        }
+    }
     if let Some(extra) = load_json(&app.paths.usr.join("packages.json")) {
         let extra: Vec<Package> = serde_json::from_value(extra).unwrap_or_default();
         for e in extra {
@@ -169,6 +180,161 @@ pub fn catalogue(app: &App) -> Vec<Package> {
         }
     }
     items
+}
+
+/// Version of an entry's series ("8.6", 28, …) for ordering; empty for "lts"/"newest" entries.
+fn series_key(p: &Package) -> Vec<u64> {
+    let v = p.source.get("series").or_else(|| p.source.get("major"));
+    let s = match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    let key = version_key(&s);
+    if key.is_empty() {
+        s.parse::<u64>().map(|n| vec![n]).unwrap_or_default() // a bare major like 28
+    } else {
+        key
+    }
+}
+
+/// Where a discovered entry goes: among its tool's entries, before the first older series
+/// (the built-in lists run newest first), or after the tool's last entry.
+fn insert_position(items: &[Package], p: &Package) -> usize {
+    let key = series_key(p);
+    let same: Vec<usize> = items.iter().enumerate().filter(|(_, i)| i.tool == p.tool).map(|(n, _)| n).collect();
+    same.iter()
+        .copied()
+        .find(|&n| {
+            let k = series_key(&items[n]);
+            !k.is_empty() && k < key
+        })
+        .or_else(|| same.last().map(|n| n + 1))
+        .unwrap_or(items.len())
+}
+
+// ------------------------------------------------------------------ discovery
+fn discovered_path(app: &App) -> PathBuf {
+    app.paths.tmp.join("discovered.json")
+}
+
+/// The Laravel recipes found by the last `discover` (empty if it never ran).
+pub fn discovered_laravel(app: &App) -> Vec<crate::quickapp::Recipe> {
+    load_json(&discovered_path(app)).and_then(|v| serde_json::from_value(v["laravel"].clone()).ok()).unwrap_or_default()
+}
+
+fn pkg(id: String, label: String, tool: &str, source: Value) -> Package {
+    Package { id, label, tool: tool.into(), source }
+}
+
+/// Series the sources publish that the catalogue doesn't have yet. Pure, so it can be tested
+/// with saved responses; `None` means that source couldn't be reached.
+pub fn new_packages(
+    have: &std::collections::HashSet<String>,
+    php: Option<&Value>,
+    nuget: Option<&Value>,
+    node: Option<&Value>,
+    mariadb: Option<&Value>,
+    postgres: Option<&Value>,
+    mongo: Option<&Value>,
+) -> Vec<Package> {
+    let mut out: Vec<Package> = vec![];
+    let mut add = |p: Package| {
+        if !have.contains(&p.id) && !out.iter().any(|o: &Package| o.id == p.id) {
+            out.push(p);
+        }
+    };
+    let series_of_version = |v: &str| v.split('.').take(2).collect::<Vec<_>>().join(".");
+    if let Some(o) = php.and_then(Value::as_object) {
+        for s in o.keys().filter(|s| version_key(s).len() == 2) {
+            add(pkg(format!("php-{s}"), format!("PHP {s} (latest patch)"), "php", json!({"type": "php", "series": s})));
+        }
+    }
+    if let Some(list) = nuget.and_then(|v| v["versions"].as_array()) {
+        for s in list.iter().filter_map(Value::as_str).filter(|v| !v.contains('-')).map(series_of_version) {
+            if version_key(&s) >= vec![3, 8] {
+                add(pkg(format!("python-{s}"), format!("Python {s}"), "python", json!({"type": "python", "series": s})));
+            }
+        }
+    }
+    if let Some(list) = node.and_then(Value::as_array) {
+        let majors: Vec<u64> = list
+            .iter()
+            .filter(|r| r["files"].as_array().is_some_and(|f| f.iter().any(|x| x == "win-x64-zip")))
+            .filter_map(|r| s(r, "version").trim_start_matches('v').split('.').next().and_then(|m| m.parse().ok()))
+            .collect();
+        let newest = majors.iter().copied().max().unwrap_or(0);
+        // Even majors become LTS; odd ones are short-lived, so only the newest is offered.
+        for m in majors.into_iter().filter(|m| *m >= 16 && (m % 2 == 0 || *m == newest)) {
+            add(pkg(format!("nodejs-{m}"), format!("Node.js {m}"), "nodejs", json!({"type": "node", "major": m})));
+        }
+    }
+    if let Some(list) = mariadb.and_then(|v| v["major_releases"].as_array()) {
+        for r in list.iter().filter(|r| s(r, "release_status") == "Stable") {
+            let id = s(r, "release_id");
+            let lts = s(r, "release_support_type").contains("Long Term");
+            add(pkg(format!("mariadb-{id}"), format!("MariaDB {id}{}", if lts { " LTS" } else { "" }), "mysql", json!({"type": "mariadb", "series": id})));
+        }
+    }
+    if let Some(list) = postgres.and_then(Value::as_array) {
+        for r in list.iter().filter(|r| r["supported"].as_bool().unwrap_or(false)) {
+            let major = r["major"].to_string().trim_matches('"').to_string();
+            add(pkg(format!("postgresql-{major}"), format!("PostgreSQL {major}"), "postgresql", json!({"type": "postgresql", "major": major})));
+        }
+    }
+    if let Some(list) = mongo.and_then(|v| v["versions"].as_array()) {
+        for v in list.iter().filter(|v| v["production_release"].as_bool().unwrap_or(false)) {
+            let series = series_of_version(s(v, "version"));
+            if version_key(&series) >= vec![6, 0] {
+                add(pkg(format!("mongodb-{series}"), format!("MongoDB {series}"), "mongodb", json!({"type": "mongodb", "series": format!("{series}.")})));
+            }
+        }
+    }
+    out
+}
+
+/// Look for new series (PHP 8.6, Python 3.16, Node 28, MariaDB 13, PostgreSQL 19, Laravel 14,
+/// …) and remember them in tmp/discovered.json, so they appear on the Install and New project
+/// pages without a devstack update. Sources that can't be reached are skipped.
+pub fn discover(app: &App, log: Log) -> Result<usize> {
+    let mut have: std::collections::HashSet<String> =
+        serde_json::from_str::<Vec<Package>>(assets::PACKAGES_JSON).unwrap_or_default().into_iter().map(|p| p.id).collect();
+    if let Some(extra) = load_json(&app.paths.usr.join("packages.json")).and_then(|v| serde_json::from_value::<Vec<Package>>(v).ok()) {
+        have.extend(extra.into_iter().map(|p| p.id));
+    }
+    let fetch = |name: &str, url: &str| match http_json(url) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log(&format!("Couldn't check {name} for new versions: {e:#}"));
+            None
+        }
+    };
+    let php = php_releases().map(|(_, v)| v).map_err(|e| log(&format!("Couldn't check PHP for new versions: {e:#}"))).ok();
+    let found = new_packages(
+        &have,
+        php.as_ref(),
+        fetch("Python", "https://api.nuget.org/v3-flatcontainer/python/index.json").as_ref(),
+        fetch("Node.js", "https://nodejs.org/dist/index.json").as_ref(),
+        fetch("MariaDB", "https://downloads.mariadb.org/rest-api/mariadb/").as_ref(),
+        fetch("PostgreSQL", "https://www.postgresql.org/versions.json").as_ref(),
+        fetch("MongoDB", "https://downloads.mongodb.org/current.json").as_ref(),
+    );
+    let laravel = fetch("Laravel", "https://repo.packagist.org/p2/laravel/laravel.json")
+        .map(|v| crate::quickapp::laravel_recipes(&v))
+        .unwrap_or_else(|| discovered_laravel(app));
+    let before: Vec<String> = load_json(&discovered_path(app))
+        .and_then(|v| serde_json::from_value::<Vec<Package>>(v["packages"].clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let fresh: Vec<&Package> = found.iter().filter(|p| !before.contains(&p.id)).collect();
+    for p in &fresh {
+        log(&format!("New on the Install page: {}", p.label));
+    }
+    let doc = json!({"checked": crate::util::now_secs(), "packages": found, "laravel": laravel});
+    crate::util::write_if_changed(&discovered_path(app), &serde_json::to_string_pretty(&doc)?)?;
+    Ok(fresh.len())
 }
 
 pub fn find(app: &App, id: &str) -> Result<Package> {
@@ -272,6 +438,40 @@ fn mariadb(series: &str) -> Result<Resolved> {
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Newest patch of a MySQL series on cdn.mysql.com. dev.mysql.com can't be read, but the CDN
+/// serves every release: the current one under Downloads/, older ones under archives/. So
+/// walk up from the last patch devstack knew about until a number doesn't exist.
+fn mysql_newest(series: &str, from: u64) -> Result<Resolved> {
+    let file = |p: u64| format!("mysql-{series}.{p}-winx64.zip");
+    let exists = |url: &str| client().head(url).send().is_ok_and(|r| r.status().is_success());
+    let current = |p: u64| format!("https://cdn.mysql.com/Downloads/MySQL-{series}/{}", file(p));
+    let (mut newest, mut misses) = (None, 0);
+    for p in from..from + 40 {
+        if exists(&current(p)) {
+            newest = Some(p);
+            misses = 0;
+        } else if newest.is_some() {
+            break;
+        } else {
+            misses += 1;
+            if misses > 6 {
+                break;
+            }
+        }
+    }
+    let (url, patch) = match newest {
+        Some(p) => (current(p), p),
+        None => {
+            let old = format!("https://cdn.mysql.com/archives/mysql-{series}/{}", file(from));
+            if !exists(&old) {
+                return Err(package_err(format!("Couldn't find MySQL {series} on cdn.mysql.com.")));
+            }
+            (old, from)
+        }
+    };
+    Ok(Resolved { url, folder: format!("mysql-{series}.{patch}"), sha256: None, sha512: None, filename: None })
 }
 
 /// The first URL that answers a HEAD request with success.
@@ -389,6 +589,7 @@ pub fn resolve(app: &App, item: &Package) -> Result<Resolved> {
         }
         "python" => python_nuget(&series_of(src)),
         "mariadb" => mariadb(&series_of(src)),
+        "mysql" => mysql_newest(&series_of(src), src["from"].as_u64().unwrap_or(0)),
         "go" => {
             let rels = http_json("https://go.dev/dl/?mode=json")?;
             for r in rels.as_array().into_iter().flatten().filter(|r| r["stable"].as_bool().unwrap_or(false)) {
@@ -576,7 +777,7 @@ pub fn install(app: &App, item: &Package, log: Log) -> Result<PathBuf> {
         log(&format!("{} is already installed.", r.folder));
         return Ok(target);
     }
-    let before = app.active(&item.tool);
+    let before = app.default_version(&item.tool);
     let mut name = r.filename.clone().unwrap_or_else(|| url_file(&r.url));
     if name.is_empty() || !name.contains('.') {
         name = format!("{}.zip", r.folder);

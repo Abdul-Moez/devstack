@@ -143,7 +143,7 @@ pub fn generic_start<S: Service + ?Sized>(s: &S, app: &App, log: Log) -> Result<
         log(&format!("{} is already running", s.name()));
         return Ok(());
     }
-    let v = s.version(app).ok_or_else(|| service_err(format!("{} is not installed. Add it from Tools > Quick add.", s.name())))?;
+    let v = s.version(app).ok_or_else(|| service_err(format!("{} is not installed. Add it on the Install page.", s.name())))?;
     let table = listening();
     for p in s.ports(app) {
         if let Some(owner) = port_owner(p, &table) {
@@ -676,7 +676,7 @@ impl Service for Postgres {
             log("PostgreSQL is already running");
             return Ok(());
         }
-        let v = self.version(app).ok_or_else(|| service_err("PostgreSQL is not installed. Add it from Tools > Quick add."))?;
+        let v = self.version(app).ok_or_else(|| service_err("PostgreSQL is not installed. Add it on the Install page."))?;
         let port = self.ports(app)[0];
         if let Some(owner) = port_owner(port, &listening()) {
             return Err(service_err(format!("PostgreSQL: port {port} is already in use by {owner}.")));

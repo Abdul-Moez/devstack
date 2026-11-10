@@ -40,16 +40,16 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 
 | File | What it does |
 |---|---|
-| `src/core.rs` | `App`: start_all / stop_all / reload / switch_version / set_web_server / set_ssl / PATH / doctor. The CLI and GUI only call this. |
+| `src/core.rs` | `App`: start_all / stop_all / reload / switch_version / set_web_server / set_ssl / projects (`set_project`, `save_project_versions`, project-aware `active`) / PATH / doctor. The CLI and GUI only call this. |
 | `src/services.rs` | `Service` trait (default methods do port checks, spawn, health check, stop) + one struct per program: Apache, Nginx, Php (php-cgi pool), MySql, Postgres, Mongo, Redis, Memcached, Mailpit. |
 | `src/configs.rs` | Renders `assets/templates/*.j2` (minijinja) into `etc/` (php.ini into the PHP folder). Returns which services' configs changed. |
 | `src/sites.rs` | Each folder in `www/` → a site (`{name}.test`, `public/` docroot if present, `usr/sites.json` overrides; `"proxy": <port>` forwards the site to an app server). |
 | `src/hosts.rs` | Owns one marked block in the hosts file; writes through a UAC helper only when it changed. |
 | `src/ssl.rs` | Local CA + per-site certs (rcgen), trust via `certutil -user`. |
-| `src/packages.rs` | Quick add: resolvers → download → checksum → extract to `bin/<tool>/<folder>/`. Sources: php (releases.json, archive folder for 7.0-7.3), python (official NuGet package, SHA-512), mariadb (REST API, SHA-256), node, composer (`lts` = 2.2), github, go, phpmyadmin, postgresql, mongodb, scrape, url (`urls` = mirrors). |
+| `src/packages.rs` | Quick add: resolvers → download → checksum → extract to `bin/<tool>/<folder>/`. `discover` finds new series + Laravel majors (tmp/discovered.json). Sources: php (releases.json, archive folder for 7.0-7.3), mysql (walks cdn.mysql.com patches), python (official NuGet package, SHA-512), mariadb (REST API, SHA-256), node, composer (`lts` = 2.2), github, go, phpmyadmin, postgresql, mongodb, scrape, url (`urls` = mirrors). |
 | `src/updates.rs` | Daily: newest PHP patch per installed series, cacert.pem refresh. |
 | `src/database.rs` | MySQL tools (create db, root password, backups, recover/restore), PostgreSQL backup, scheduled backups. |
-| `src/quickapp.rs` | Quick app recipes (built-in list merged with `usr/quickapps.json`): blank, zip, composer, command, python (.venv + pip + commands, proxy site on a free port 8001+, `run.bat`, dev server opened in a console). Composer 2.2 LTS is picked automatically for PHP < 7.2.5. |
+| `src/quickapp.rs` | Quick app recipes (built-in list merged with `usr/quickapps.json`): blank, zip, composer, command, python (.venv + pip + commands, proxy site on a free port 8001+, `run.bat`, dev server opened in a console). Composer 2.2 LTS is picked automatically for PHP < 7.2.5. Laravel majors come from Packagist (`laravel_recipes`). |
 | `src/share.rs` | ngrok tunnel and its public URL. |
 | `src/winutil.rs` | **All Win32 code**: UAC elevation, user PATH, autostart, junctions, show/hide window, single instance, terminals. |
 | `src/procs.rs` | Detached spawning, PID + start-time tracking in `tmp/state.json`, port owners (netstat2/sysinfo). |
@@ -99,6 +99,16 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
     The status lights are the one bold element. No nested popup menus in the window (pages
     instead); sentence-case copy; icons from Segoe Fluent Icons, never emoji. Check changes
     with screenshots of the real window.
+15. **Projects.** A site with `"versions"` in usr/sites.json is a project. `App::active(tool)`
+    = the chosen project's version, else the default (`versions.<tool>` in settings,
+    `App::default_version`). The choice and its versions live in tmp/state.json
+    (`"project"`). `set_project` restarts running services whose version changes; while a
+    project sets a tool, `switch_version` only changes the default. Quick add pins
+    defaults, never project versions.
+16. **New versions appear by themselves.** `packages::discover` (daily, `ds discover`, Install
+    page button) adds new series to tmp/discovered.json and Laravel majors from Packagist;
+    `catalogue()`/`recipes()` merge them. Odd Node majors only while newest. MySQL LTS entries
+    walk cdn.mysql.com for newer patches (`"type": "mysql"`); never scrape dev.mysql.com.
 
 ## Old versions
 
@@ -136,3 +146,6 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
   binaries into a fake `bin/` tree. Use `DEVSTACK_ROOT` and `DEVSTACK_HOSTS` to point at a
   test folder and a fake hosts file.
 * `ds doctor` after changes; failing services include their last log lines in the error.
+* **Anything that runs `prepare` (start, reload, set_project, quick app) syncs the hosts
+  file.** In tests and when trying things against dev-root, set `DEVSTACK_HOSTS` to a fake
+  file first, or Windows will ask for admin rights to edit the real one.

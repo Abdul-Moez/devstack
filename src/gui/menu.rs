@@ -1,6 +1,6 @@
-//! One menu definition, rendered both as the window's "Menu" button (egui) and as the tray
-//! icon's right-click menu (native).
+//! The tray icon's right-click menu (native). `Action` is also what the window's pages emit.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,12 @@ pub enum Action {
     Lan(bool),
     /// Quick app recipe index + project name.
     CreateProject(usize, String),
+    /// Switch to a project's versions (None = the defaults). Also in the tray.
+    Project(Option<String>),
+    /// Save a project's versions (tool -> version folder; missing = default).
+    SaveProjectVersions(String, BTreeMap<String, String>),
+    /// Look for new versions of every tool and new Laravel majors.
+    Discover,
 }
 
 impl Action {
@@ -222,15 +228,28 @@ pub fn model(app: &App) -> Vec<Node> {
         item("Doctor (check setup)", Action::Doctor),
     ];
 
+    // Projects: switch to a project's versions (or back to the defaults) from the tray.
+    let chosen = app.project();
+    let mut projects = vec![Node::Check("Default versions".into(), chosen.is_none(), Action::Project(None))];
+    let with_versions: Vec<&crate::sites::Site> = sites.iter().filter(|s| !s.versions.is_empty()).collect();
+    if !with_versions.is_empty() {
+        projects.push(Node::Sep);
+    }
+    for s in with_versions {
+        projects.push(Node::Check(s.name.clone(), chosen.as_deref() == Some(s.name.as_str()), Action::Project(Some(s.name.clone()))));
+    }
+    projects.extend([Node::Sep, item("Set a project's versions…", Action::Page("sites".into()))]);
+
     vec![
         item("Show window", Action::ShowWindow),
         Node::Sep,
-        item("Start All", Action::StartAll),
-        item("Stop All", Action::StopAll),
+        item("Start all", Action::StartAll),
+        item("Stop all", Action::StopAll),
         item("Reload", Action::Reload),
         Node::Sep,
+        Node::Sub(format!("Project: {}", chosen.as_deref().unwrap_or("default versions")), projects),
         Node::Sub("www".into(), www),
-        Node::Sub("Quick app".into(), qa),
+        Node::Sub("New project".into(), qa),
         Node::Sub("Web server".into(), webm),
         Node::Sub("PHP".into(), php),
         Node::Sub("MySQL".into(), mysql),
@@ -238,7 +257,7 @@ pub fn model(app: &App) -> Vec<Node> {
         item("Mailpit inbox", Action::OpenMail),
         Node::Sub("Tools".into(), tools),
         Node::Sep,
-        item("Preferences…", Action::Preferences),
+        item("Settings…", Action::Preferences),
         item("Open root folder", Action::OpenPath(p.root.clone())),
         Node::Sep,
         item("Exit", Action::Exit),

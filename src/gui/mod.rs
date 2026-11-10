@@ -9,7 +9,7 @@ mod pages;
 mod theme;
 mod tray;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -134,6 +134,16 @@ fn background(jobs: &Jobs, action: &Action) -> bool {
             Ok(Outcome::Nothing)
         }),
         Action::Version(tool, name) => jobs.spawn(true, false, move |app, log| app.switch_version(&tool, &name, log).map(|_| Outcome::Nothing)),
+        Action::Project(name) => jobs.spawn(true, false, move |app, log| app.set_project(name.as_deref(), log).map(|_| Outcome::Nothing)),
+        Action::SaveProjectVersions(name, versions) => {
+            jobs.spawn(true, false, move |app, log| app.save_project_versions(&name, &versions, log).map(|_| Outcome::Nothing))
+        }
+        Action::Discover => jobs.spawn_keyed("discover".into(), |app, log| {
+            if packages::discover(app, log)? == 0 {
+                log("No new versions since the last check.");
+            }
+            Ok(Outcome::Nothing)
+        }),
         Action::Ext(e, on) => jobs.spawn(true, false, move |app, log| app.toggle_extension(&e, on, log).map(|_| Outcome::Nothing)),
         Action::TrustCa => jobs.spawn(false, false, |app, log| {
             log(if ssl::trust(&app.paths)? { "Local CA trusted. Restart your browser if it still warns." } else { "The CA was not trusted (cancelled)." });
@@ -293,6 +303,8 @@ struct Row {
     installed: bool,
     versions: Vec<String>,
     active: Option<String>,
+    /// The chosen project sets this tool's version.
+    overridden: bool,
 }
 
 impl Row {
@@ -345,6 +357,10 @@ pub struct GuiApp {
     catalogue: Vec<Package>,
     recipes: Vec<Recipe>,
     installed: HashMap<String, (Vec<String>, Option<String>)>,
+    project: Option<String>,
+    project_versions: BTreeMap<String, String>,
+    /// Sites page: the project whose versions are being edited, with the draft.
+    editing: Option<(String, BTreeMap<String, String>)>,
     ssl_on: bool,
     lan_on: bool,
     web: String,
@@ -412,6 +428,9 @@ impl GuiApp {
             catalogue: vec![],
             recipes: vec![],
             installed: HashMap::new(),
+            project: None,
+            project_versions: BTreeMap::new(),
+            editing: None,
             ssl_on: false,
             lan_on: false,
             web: String::new(),
@@ -460,6 +479,11 @@ impl GuiApp {
         self.page = page;
         match (page, detail) {
             (Page::Install, Some(tool)) => self.install_tool = tool,
+            (Page::Sites, Some(project)) => {
+                if let Some(s) = self.sites.iter().find(|s| s.name == project) {
+                    self.editing = Some((s.name.clone(), s.versions.clone()));
+                }
+            }
             (Page::Settings, Some(tab)) => {
                 let app = self.jobs.app.clone();
                 let prefs = self.prefs.get_or_insert_with(|| pages::Prefs::load(&app));
@@ -479,6 +503,8 @@ impl GuiApp {
         // Pick up changes made with `ds` (or by hand) while the window is open.
         app.settings.refresh();
         app.secrets.refresh();
+        self.project = app.project();
+        self.project_versions = app.project_versions();
         let mut any_up = false;
         self.rows = app
             .services()
@@ -503,6 +529,7 @@ impl GuiApp {
                     installed,
                     versions: app.versions(s.tool()).into_iter().map(|v| v.name).collect(),
                     active: app.active(s.tool()).map(|v| v.name),
+                    overridden: self.project_versions.contains_key(s.tool()),
                 };
                 any_up |= row.up();
                 row

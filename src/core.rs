@@ -4,14 +4,14 @@
 //! background jobs never run two of them at once. Internal `*_inner` functions assume the
 //! lock is held, which is how operations call each other without deadlocking.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{anyhow, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::error::{service_err, DsError};
 use crate::paths::{find_root, Paths};
@@ -21,6 +21,9 @@ use crate::sites::{self, Site};
 use crate::util::{fwd, path_sep, IS_WIN};
 use crate::versions::{self, Version};
 use crate::{configs, hosts, share, ssl, updates, winutil, Log};
+
+/// Tools a project can pin to its own version.
+pub const PROJECT_TOOLS: &[&str] = &["php", "mysql", "postgresql", "nodejs", "python"];
 
 /// Tools exposed on PATH (via bin/current/<tool> junctions) and the subfolders that hold executables.
 pub const PATH_TOOLS: &[(&str, &[&str])] = &[
@@ -109,10 +112,34 @@ impl App {
         versions::root(&self.paths.bin, tool)
     }
 
+    /// The version in use: the active project's choice for this tool, else the default.
     pub fn active(&self, tool: &str) -> Option<Version> {
+        let all = self.versions(tool);
+        if let Some(wanted) = self.project_versions().get(tool) {
+            if let Some(v) = all.iter().find(|v| &v.name == wanted) {
+                return Some(v.clone());
+            }
+        }
+        let wanted = self.settings.str(&format!("versions.{tool}"));
+        all.iter().find(|v| v.name == wanted).cloned().or_else(|| all.into_iter().next())
+    }
+
+    /// The default version (what's used when no project is chosen).
+    pub fn default_version(&self, tool: &str) -> Option<Version> {
         let all = self.versions(tool);
         let wanted = self.settings.str(&format!("versions.{tool}"));
         all.iter().find(|v| v.name == wanted).cloned().or_else(|| all.into_iter().next())
+    }
+
+    /// The chosen project, if any.
+    pub fn project(&self) -> Option<String> {
+        self.state.value("project")["name"].as_str().map(str::to_string)
+    }
+
+    /// Versions the chosen project uses (empty with no project). Stored in tmp/state.json when
+    /// the project is chosen, so every lookup doesn't re-read usr/sites.json.
+    pub fn project_versions(&self) -> BTreeMap<String, String> {
+        serde_json::from_value(self.state.value("project")["versions"].clone()).unwrap_or_default()
     }
 
     pub fn sites(&self) -> Vec<Site> {
@@ -183,7 +210,7 @@ impl App {
                 continue;
             }
             if !s.installed(self) {
-                log(&format!("{} is enabled but not installed; skipped (Tools > Quick add).", s.name()));
+                log(&format!("{} is enabled but not installed; skipped (Install page).", s.name()));
                 continue;
             }
             if let Err(e) = s.start(self, log) {
@@ -276,10 +303,17 @@ impl App {
     }
 
     // ------------------------------------------------------------------ changes
+    /// Change the default version of a tool (and restart its service if it's running).
     pub fn switch_version(&self, tool: &str, name: &str, log: Log) -> Result<()> {
         let _g = self.lock();
         if !self.versions(tool).iter().any(|v| v.name == name) {
             return Err(service_err(format!("{name} is not installed. Run 'ds versions {tool}'.")));
+        }
+        if let (Some(project), Some(theirs)) = (self.project(), self.project_versions().get(tool).cloned()) {
+            // The chosen project decides this tool; only the default changes, for later.
+            self.settings.set(&format!("versions.{tool}"), json!(name))?;
+            log(&format!("Default {tool} is now {name}. Project {project} keeps using {theirs} until you choose another project."));
+            return Ok(());
         }
         let svc = self.service_for_tool(tool);
         let was = svc.map(|s| s.running(self)).unwrap_or(false);
@@ -303,6 +337,69 @@ impl App {
             }
         }
         log(&format!("{tool}: now using {name}"));
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ projects
+    /// Choose a project (a site with its own versions in usr/sites.json), or `None` for the
+    /// default versions. Running services whose version changes are stopped and started again
+    /// with the new one; the rest just get their configs refreshed. Start all afterwards uses
+    /// the project's versions.
+    pub fn set_project(&self, name: Option<&str>, log: Log) -> Result<()> {
+        let _g = self.lock();
+        let wanted: BTreeMap<String, String> = match name {
+            None => BTreeMap::new(),
+            Some(n) => {
+                let site = self
+                    .sites()
+                    .into_iter()
+                    .find(|s| s.name == n)
+                    .ok_or_else(|| service_err(format!("There's no project called {n} in www.")))?;
+                for (tool, v) in &site.versions {
+                    if !self.versions(tool).iter().any(|x| &x.name == v) {
+                        return Err(service_err(format!("{n} uses {v}, which isn't installed. Install it, or change the project's versions on the Sites page.")));
+                    }
+                }
+                site.versions
+            }
+        };
+        let after = |tool: &str| wanted.get(tool).cloned().or_else(|| self.default_version(tool).map(|v| v.name));
+        let mut restart = vec![];
+        for s in self.services.iter().rev() {
+            if s.running(self) && s.version(self).map(|v| v.name) != after(s.tool()) {
+                s.stop(self, log, false)?; // a database that won't stop asks the user (NeedsForce)
+                restart.push(s.id());
+            }
+        }
+        match name {
+            Some(n) => self.state.put("project", json!({"name": n, "versions": wanted}))?,
+            None => self.state.put("project", Value::Null)?,
+        }
+        self.reload_inner(log)?; // new php.ini, Apache's PHP module path, PATH links, …
+        for id in restart.iter().rev() {
+            let s = self.find_svc(id)?;
+            if s.enabled(self) {
+                s.start(self, log)?;
+            }
+        }
+        match name {
+            Some(n) if wanted.is_empty() => log(&format!("Project {n} (it uses the default versions)")),
+            Some(n) => log(&format!(
+                "Project {n}: {}",
+                wanted.iter().map(|(t, v)| format!("{t} {v}")).collect::<Vec<_>>().join(", ")
+            )),
+            None => log("Using the default versions"),
+        }
+        Ok(())
+    }
+
+    /// Save a project's versions; if it's the chosen project, switch to them right away.
+    pub fn save_project_versions(&self, name: &str, versions: &BTreeMap<String, String>, log: Log) -> Result<()> {
+        sites::set_versions(self, name, versions)?;
+        log(&format!("Saved the versions for {name}"));
+        if self.project().as_deref() == Some(name) {
+            self.set_project(Some(name), log)?;
+        }
         Ok(())
     }
 

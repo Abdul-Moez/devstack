@@ -14,6 +14,21 @@ use crate::settings::ProcRec;
 use crate::sites::Site;
 use crate::util::{fwd, valid_name};
 
+/// "PHP 7.4.33", "MariaDB 11.4.13", "Node.js 20.20.2" for a project's tool + version folder.
+fn version_label(tool: &str, folder: &str) -> String {
+    let number = crate::util::parse_version(folder).unwrap_or_else(|| folder.to_string());
+    let name = match tool {
+        "php" => "PHP",
+        "mysql" if folder.contains("mariadb") => "MariaDB",
+        "mysql" => "MySQL",
+        "postgresql" => "PostgreSQL",
+        "nodejs" => "Node.js",
+        "python" => "Python",
+        other => other,
+    };
+    format!("{name} {number}")
+}
+
 fn line_color(line: &str) -> Color32 {
     if line.contains("ERROR") {
         LED_ERR
@@ -48,6 +63,12 @@ fn service_row(ui: &mut Ui, r: &Row, cols: &[f32; 6], busy: bool, apache_up: boo
                 if theme::link(ui, "Install…", FontId::proportional(13.5), ASH).clicked() {
                     actions.push(Action::Page(format!("install:{}", r.tool)));
                 }
+            } else if r.overridden {
+                // The chosen project decides; the dropdown would only change the default.
+                ui.label(RichText::new(r.active.clone().unwrap_or_default()).color(BONE));
+                ui.add_space(8.0);
+                theme::pill(ui, "project", ASH)
+                    .on_hover_text("Set by the chosen project. Change it on the Sites page, or choose Default versions.");
             } else {
                 let current = r.active.clone().unwrap_or_default();
                 egui::ComboBox::from_id_salt(("version", &r.id)).selected_text(&current).width(cols[1] - 22.0).show_ui(ui, |ui| {
@@ -95,10 +116,12 @@ fn service_row(ui: &mut Ui, r: &Row, cols: &[f32; 6], busy: bool, apache_up: boo
     });
 }
 
-fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, actions: &mut Vec<Action>) {
+/// One site. Returns true when its "Versions" button was clicked (opens/closes the editor).
+fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, chosen: bool, editing: bool, busy: bool, actions: &mut Vec<Action>) -> bool {
     let shared = sharing.filter(|r| r.site.as_deref() == Some(s.name.as_str()));
     // Both sides exist at once, so each collects its own clicks.
     let (mut left, mut right) = (vec![], vec![]);
+    let mut toggle_editor = false;
     ui.add_space(10.0);
     egui::Sides::new().show(
         ui,
@@ -109,8 +132,14 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, actions: &mut Vec<
                         left.push(Action::OpenUrl(s.url()));
                     }
                     ui.add_space(4.0);
+                    if chosen {
+                        theme::pill(ui, "Chosen project", LED_ON);
+                    }
+                    for tech in s.stack() {
+                        theme::pill(ui, tech, SMOKE);
+                    }
                     if s.ssl {
-                        theme::pill(ui, "HTTPS", ASH);
+                        theme::pill(ui, "HTTPS", SMOKE);
                     }
                     if let Some(p) = s.proxy {
                         theme::pill(ui, &format!("App server on port {p}"), SIGNAL);
@@ -120,6 +149,10 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, actions: &mut Vec<
                     }
                 });
                 ui.label(RichText::new(fwd(&s.docroot)).font(theme::mono(12.0)).color(SMOKE));
+                if !s.versions.is_empty() {
+                    let uses: Vec<String> = s.versions.iter().map(|(t, v)| version_label(t, v)).collect();
+                    ui.label(RichText::new(format!("Uses {}", uses.join(", "))).size(12.5).color(ASH));
+                }
                 if let Some(r) = shared {
                     let url = r.url.clone().unwrap_or_default();
                     ui.horizontal(|ui| {
@@ -142,14 +175,31 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, actions: &mut Vec<
                 if theme::button(ui, Kind::Secondary, Some(icon::STOP), "Stop sharing", true).clicked() {
                     right.push(Action::StopShare);
                 }
-            } else if theme::button(ui, Kind::Ghost, Some(icon::SHARE), "Share", true).on_hover_text("Get a public link through ngrok").clicked() {
+            } else if theme::button(ui, Kind::Ghost, Some(icon::SHARE), "", true).on_hover_text("Share: get a public link through ngrok").clicked() {
                 right.push(Action::Share(s.name.clone()));
+            }
+            if theme::button(ui, if editing { Kind::Secondary } else { Kind::Ghost }, Some(icon::CODE), "Versions", true)
+                .on_hover_text("Choose the PHP, MySQL, Node.js and Python versions this project needs")
+                .clicked()
+            {
+                toggle_editor = true;
+            }
+            if chosen {
+                if theme::button(ui, Kind::Secondary, None, "Use defaults", !busy).on_hover_text("Go back to the default versions").clicked() {
+                    right.push(Action::Project(None));
+                }
+            } else if theme::button(ui, Kind::Secondary, Some(icon::PLAY), "Use this project", !busy)
+                .on_hover_text("Switch to this project's versions (running services restart with them)")
+                .clicked()
+            {
+                right.push(Action::Project(Some(s.name.clone())));
             }
         },
     );
     actions.extend(left);
     actions.extend(right);
     ui.add_space(10.0);
+    toggle_editor
 }
 
 fn recipe_hint(r: &Recipe) -> String {
@@ -222,6 +272,45 @@ impl GuiApp {
                 ui.spinner();
             }
         });
+
+        // Which versions Start all uses: a project's, or the defaults.
+        theme::panel().inner_margin(Margin::symmetric(18, 12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Project").font(theme::strong(14.0)).color(BONE));
+                ui.add_space(4.0);
+                let current = self.project.clone().unwrap_or_else(|| "Default versions".into());
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("project").selected_text(&current).width(230.0).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.project.is_none(), "Default versions").clicked() && self.project.is_some() {
+                            actions.push(Action::Project(None));
+                        }
+                        for s in &self.sites {
+                            let is = self.project.as_deref() == Some(s.name.as_str());
+                            let label = if s.versions.is_empty() { format!("{} (default versions)", s.name) } else { s.name.clone() };
+                            if ui.selectable_label(is, label).clicked() && !is {
+                                actions.push(Action::Project(Some(s.name.clone())));
+                            }
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                if self.project_versions.is_empty() {
+                    let text = if self.project.is_some() { "This project uses the default versions." } else { "Start all uses each tool's default version." };
+                    ui.label(theme::muted(text));
+                } else {
+                    for (tool, v) in &self.project_versions {
+                        theme::pill(ui, &version_label(tool, v), ASH);
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::link(ui, "Set versions per project", FontId::proportional(13.0), ASH).clicked() {
+                        actions.push(Action::Page("sites".into()));
+                    }
+                });
+            });
+        });
+        ui.add_space(14.0);
 
         let apache_up = self.rows.iter().any(|r| r.id == "apache" && r.status == "running");
         theme::panel().show(ui, |ui| {
@@ -303,21 +392,36 @@ impl GuiApp {
                 actions.push(Action::OpenPath(paths.www.clone()));
             }
         });
+        let busy = self.busy();
+        let sites = self.sites.clone();
+        let mut toggled: Option<&Site> = None;
         theme::panel().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if self.sites.is_empty() {
+            if sites.is_empty() {
                 ui.add_space(18.0);
                 ui.label(RichText::new("No projects in www yet").font(theme::strong(15.0)).color(BONE));
                 ui.label(theme::muted(format!("Create one with New project, or add a folder to {}.", paths.www.display())));
                 ui.add_space(18.0);
             }
-            for (i, s) in self.sites.iter().enumerate() {
+            for (i, s) in sites.iter().enumerate() {
                 if i > 0 {
                     theme::hairline(ui);
                 }
-                site_row(ui, s, self.sharing.as_ref(), actions);
+                let chosen = self.project.as_deref() == Some(s.name.as_str());
+                let editing = self.editing.as_ref().is_some_and(|(n, _)| n == &s.name);
+                if site_row(ui, s, self.sharing.as_ref(), chosen, editing, busy, actions) {
+                    toggled = Some(s);
+                }
+                if editing {
+                    self.version_editor(ui, actions);
+                    ui.add_space(12.0);
+                }
             }
         });
+        if let Some(s) = toggled {
+            let same = self.editing.as_ref().is_some_and(|(n, _)| n == &s.name);
+            self.editing = if same { None } else { Some((s.name.clone(), s.versions.clone())) };
+        }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label(theme::faint("Docroot, aliases, HTTPS and app-server proxies per site are set in usr/sites.json."));
@@ -325,6 +429,68 @@ impl GuiApp {
                 actions.push(Action::Edit(paths.usr.join("sites.json")));
             }
         });
+    }
+
+    /// The open project's versions: one dropdown per tool ("Default" or an installed version).
+    fn version_editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let lists: Vec<(&str, Vec<String>, Option<String>)> = crate::core::PROJECT_TOOLS
+            .iter()
+            .map(|t| {
+                let (installed, _) = self.installed.get(*t).cloned().unwrap_or_default();
+                (*t, installed, self.app().default_version(t).map(|v| v.name))
+            })
+            .collect();
+        let Some((name, draft)) = self.editing.as_mut() else { return };
+        let mut close = false;
+        egui::Frame::new().fill(theme::RAISED).stroke(Stroke::new(1.0_f32, theme::STEEL)).corner_radius(10).inner_margin(Margin::same(16)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("Versions for {name}")).font(theme::strong(14.5)).color(BONE));
+            ui.label(theme::muted("Choosing this project switches to these. Tools left on Default use the default version."));
+            ui.add_space(8.0);
+            for (tool, installed, default) in &lists {
+                ui.add_space(4.0);
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        ui.label(RichText::new(tool_label(tool)).color(BONE));
+                    },
+                    |ui| {
+                        if installed.is_empty() {
+                            if theme::link(ui, "Install", FontId::proportional(13.0), ASH).clicked() {
+                                actions.push(Action::Page(format!("install:{tool}")));
+                            }
+                            ui.label(theme::faint("None installed."));
+                            return;
+                        }
+                        let default_text = format!("Default ({})", default.clone().unwrap_or_default());
+                        let current = draft.get(*tool).cloned().unwrap_or_else(|| default_text.clone());
+                        egui::ComboBox::from_id_salt(("project-version", *tool)).selected_text(&current).width(260.0).show_ui(ui, |ui| {
+                            if ui.selectable_label(!draft.contains_key(*tool), &default_text).clicked() {
+                                draft.remove(*tool);
+                            }
+                            for v in installed {
+                                if ui.selectable_label(draft.get(*tool) == Some(v), v).clicked() {
+                                    draft.insert(tool.to_string(), v.clone());
+                                }
+                            }
+                        });
+                    },
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, Kind::Primary, Some(icon::CHECK), "Save versions", true).clicked() {
+                    actions.push(Action::SaveProjectVersions(name.clone(), draft.clone()));
+                    close = true;
+                }
+                if theme::button(ui, Kind::Ghost, None, "Cancel", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.editing = None;
+        }
     }
 
     // ------------------------------------------------------------------ New project
@@ -426,7 +592,19 @@ impl GuiApp {
 
     // ------------------------------------------------------------------ Install
     pub(super) fn page_install(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        theme::page_header(ui, "Install", "Versions install side by side. Installing never switches the active one.", |_| {});
+        let checking = self.jobs.is_pending("discover");
+        theme::page_header(ui, "Install", "Versions install side by side. Installing never switches the active one.", |ui| {
+            let label = if checking { "Checking…" } else { "Check for new versions" };
+            if theme::button(ui, Kind::Secondary, Some(icon::REFRESH), label, !checking)
+                .on_hover_text("Looks for new PHP, Python, Node.js, MariaDB, PostgreSQL and MongoDB series and new Laravel versions (also done once a day)")
+                .clicked()
+            {
+                actions.push(Action::Discover);
+            }
+            if checking {
+                ui.spinner();
+            }
+        });
         let mut tools: Vec<String> = vec![];
         for p in &self.catalogue {
             if !tools.contains(&p.tool) {

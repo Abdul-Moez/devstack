@@ -386,3 +386,139 @@ fn quick_add_catalogue_is_valid() {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn new_series_are_discovered_from_the_sources() {
+    use serde_json::json;
+    let have: std::collections::HashSet<String> = ["php-8.5", "python-3.15", "nodejs-26", "mariadb-11.4", "postgresql-18", "mongodb-8.0"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let php = json!({"8.5": {}, "8.6": {}});
+    let nuget = json!({"versions": ["3.7.9", "3.15.2", "3.16.0", "3.17.0-a1"]});
+    let node = json!([
+        {"version": "v29.0.0", "files": ["win-x64-zip"]},
+        {"version": "v28.1.0", "files": ["win-x64-zip"]},
+        {"version": "v27.9.0", "files": ["win-x64-zip"]},
+        {"version": "v26.0.0", "files": ["win-x64-zip"]},
+        {"version": "v14.0.0", "files": ["win-x64-zip"]}
+    ]);
+    let mariadb = json!({"major_releases": [
+        {"release_id": "13.1", "release_status": "RC"},
+        {"release_id": "13.0", "release_status": "Stable", "release_support_type": "Rolling"},
+        {"release_id": "11.4", "release_status": "Stable", "release_support_type": "Long Term Support"}
+    ]});
+    let pg = json!([{"major": "19", "supported": true}, {"major": "12", "supported": false}, {"major": "18", "supported": true}]);
+    let mongo = json!({"versions": [{"version": "9.1.0", "production_release": true}, {"version": "5.0.1", "production_release": true}]});
+    let ids: Vec<String> = devstack::packages::new_packages(&have, Some(&php), Some(&nuget), Some(&node), Some(&mariadb), Some(&pg), Some(&mongo))
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(ids, ["php-8.6", "python-3.16", "nodejs-29", "nodejs-28", "mariadb-13.0", "postgresql-19", "mongodb-9.1"],
+               "no pre-releases, no old odd Node majors, no RC MariaDB, no unsupported PostgreSQL, no Python < 3.8");
+}
+
+#[test]
+fn discovered_versions_join_the_catalogue_in_order() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    let doc = serde_json::json!({"packages": [
+        {"id": "php-8.6", "label": "PHP 8.6 (latest patch)", "tool": "php", "source": {"type": "php", "series": "8.6"}},
+        {"id": "nodejs-28", "label": "Node.js 28", "tool": "nodejs", "source": {"type": "node", "major": 28}}
+    ]});
+    fs::write(root.join("tmp/discovered.json"), doc.to_string()).unwrap();
+    let ids: Vec<String> = devstack::packages::catalogue(&app).into_iter().map(|p| p.id).collect();
+    let pos = |id: &str| ids.iter().position(|i| i == id).unwrap_or_else(|| panic!("{id} missing"));
+    assert_eq!(pos("php-8.6") + 1, pos("php-8.5"), "newest PHP comes first");
+    assert!(pos("nodejs-28") < pos("nodejs-26") && pos("nodejs-28") > pos("nodejs-lts"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn laravel_versions_come_from_packagist() {
+    // Packagist's minified format: later entries only list what changed.
+    let packagist = serde_json::json!({"minified": "composer/2.0", "packages": {"laravel/laravel": [
+        {"version": "v14.0.0", "require": {"php": "^8.4"}},
+        {"version": "v14.0.0-beta1"},
+        {"version": "v13.11.0", "require": {"php": "^8.3"}},
+        {"version": "v13.10.0"},
+        {"version": "v8.6.12", "require": {"php": "^7.3|^8.0"}},
+        {"version": "v6.20.1", "require": {"php": "^7.2.5|^8.0"}},
+        {"version": "v5.5.28", "require": {"php": ">=7.0.0"}},
+        {"version": "v5.4.30", "require": {"php": ">=5.6.4"}}
+    ]}});
+    let r = devstack::quickapp::laravel_recipes(&packagist);
+    let names: Vec<&str> = r.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["Laravel 14 (PHP 8.4+)", "Laravel 13 (PHP 8.3+)", "Laravel 8 (PHP 7.3+)", "Laravel 6 LTS (PHP 7.2+)", "Laravel 5.5 LTS (PHP 7.0+)"]);
+    assert_eq!(r[0].package.as_deref(), Some("laravel/laravel:^14.0"));
+    assert_eq!(r[4].package.as_deref(), Some("laravel/laravel:5.5.*"));
+
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    fs::write(root.join("tmp/discovered.json"), serde_json::json!({"packages": [], "laravel": r}).to_string()).unwrap();
+    let recipes: Vec<String> = devstack::quickapp::recipes(&app).into_iter().map(|r| r.name).collect();
+    assert!(recipes.contains(&"Laravel 14 (PHP 8.4+)".to_string()) && recipes.contains(&"Laravel".to_string()));
+    assert!(!recipes.contains(&"Laravel 10 (PHP 8.1+)".to_string()), "the built-in pinned list is replaced");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn projects_choose_their_own_versions() {
+    let root = temp_root();
+    // Choosing a project syncs the hosts file: use a fake one, never the real one (writing
+    // that would ask Windows for admin rights).
+    let fake_hosts = root.join("hosts");
+    fs::write(&fake_hosts, "127.0.0.1 localhost
+").unwrap();
+    std::env::set_var("DEVSTACK_HOSTS", &fake_hosts);
+    let app = App::new(Some(root.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    for v in ["php-8.4.14-ts", "php-7.4.33-ts"] {
+        touch(&root.join("bin/php").join(v).join(exe("php-cgi")));
+    }
+    for v in ["mysql-8.4.13", "mysql-5.7.44"] {
+        touch(&root.join("bin/mysql").join(v).join("bin").join(exe("mysqld")));
+    }
+    touch(&root.join("bin/nodejs/node-20.20.2").join(exe("node")));
+    app.settings.set("versions.php", serde_json::json!("php-8.4.14-ts")).unwrap();
+    fs::create_dir_all(root.join("www/legacy")).unwrap();
+    touch(&root.join("www/legacy/composer.json"));
+    touch(&root.join("www/legacy/package.json"));
+
+    let mut versions = std::collections::BTreeMap::new();
+    versions.insert("php".to_string(), "php-7.4.33-ts".to_string());
+    versions.insert("mysql".to_string(), "mysql-5.7.44".to_string());
+    app.save_project_versions("legacy", &versions, &|_| {}).unwrap();
+    let site = app.sites().into_iter().find(|s| s.name == "legacy").unwrap();
+    assert_eq!(site.versions, versions);
+    assert_eq!(site.stack(), ["PHP", "Node"]);
+
+    assert_eq!(app.active("php").unwrap().name, "php-8.4.14-ts", "no project chosen yet: defaults");
+    app.set_project(Some("legacy"), &|_| {}).unwrap();
+    assert_eq!(app.project().as_deref(), Some("legacy"));
+    assert_eq!(app.active("php").unwrap().name, "php-7.4.33-ts");
+    assert_eq!(app.active("mysql").unwrap().name, "mysql-5.7.44");
+    assert_eq!(app.active("nodejs").unwrap().name, "node-20.20.2", "tools the project doesn't set keep the default");
+    let ini = fs::read_to_string(root.join("bin/php/php-7.4.33-ts/php.ini")).unwrap();
+    assert!(ini.contains("php-7.4.33-ts/ext"), "configs follow the project's PHP");
+
+    // Picking a default version while the project decides PHP only changes the default.
+    app.switch_version("php", "php-7.4.33-ts", &|_| {}).unwrap();
+    assert_eq!(app.default_version("php").unwrap().name, "php-7.4.33-ts");
+    app.switch_version("php", "php-8.4.14-ts", &|_| {}).unwrap();
+    assert_eq!(app.active("php").unwrap().name, "php-7.4.33-ts");
+
+    assert!(fs::read_to_string(&fake_hosts).unwrap().contains("127.0.0.1 legacy.test"));
+    app.set_project(None, &|_| {}).unwrap();
+    assert_eq!(app.project(), None);
+    assert_eq!(app.active("php").unwrap().name, "php-8.4.14-ts");
+
+    assert!(app.set_project(Some("nope"), &|_| {}).is_err(), "unknown project");
+    versions.insert("php".to_string(), "php-5.6.40".to_string());
+    app.save_project_versions("legacy", &versions, &|_| {}).unwrap();
+    let err = app.set_project(Some("legacy"), &|_| {}).unwrap_err().to_string();
+    assert!(err.contains("isn't installed"), "{err}");
+    versions.insert("php".to_string(), "../../evil".to_string());
+    assert!(app.save_project_versions("legacy", &versions, &|_| {}).is_err(), "unsafe names are refused");
+    let _ = fs::remove_dir_all(root);
+}

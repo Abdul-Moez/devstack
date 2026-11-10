@@ -50,8 +50,76 @@ pub struct Recipe {
     pub django: bool,
 }
 
+fn is_pinned_laravel(r: &Recipe) -> bool {
+    r.kind == "composer" && r.package.as_deref().is_some_and(|p| p.starts_with("laravel/laravel:"))
+}
+
+/// One recipe per Laravel major (and 5.5-5.8) from Packagist's metadata, newest first, each
+/// named with the PHP version it needs: "Laravel 13 (PHP 8.3+)". New majors appear as soon as
+/// they're published.
+pub fn laravel_recipes(packagist: &Value) -> Vec<Recipe> {
+    let Some(rows) = packagist["packages"]["laravel/laravel"].as_array() else { return vec![] };
+    // Packagist's "composer/2.0" format is minified: each entry lists only what changed.
+    let mut cur = serde_json::Map::new();
+    let mut seen: Vec<String> = vec![];
+    let mut out = vec![];
+    let php_re = Regex::new(r"(\d+)\.(\d+)").unwrap();
+    for row in rows {
+        if let Some(o) = row.as_object() {
+            for (k, v) in o {
+                if v == "__unset" {
+                    cur.remove(k);
+                } else {
+                    cur.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let version = cur.get("version").and_then(Value::as_str).unwrap_or("");
+        let Some(v) = version.strip_prefix('v').filter(|v| !v.contains('-')) else { continue };
+        let parts: Vec<u64> = v.split('.').filter_map(|p| p.parse().ok()).collect();
+        let (Some(&major), Some(&minor)) = (parts.first(), parts.get(1)) else { continue };
+        let (key, package) = if major >= 6 {
+            (major.to_string(), format!("laravel/laravel:^{major}.0"))
+        } else if major == 5 && minor >= 5 {
+            (format!("5.{minor}"), format!("laravel/laravel:5.{minor}.*"))
+        } else {
+            continue;
+        };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let php = cur.get("require").and_then(|r| r.get("php")).and_then(Value::as_str).unwrap_or("");
+        let needs = php_re.captures(php).map(|c| format!(" (PHP {}.{}+)", &c[1], &c[2])).unwrap_or_default();
+        let lts = if key == "6" || key == "5.5" { " LTS" } else { "" };
+        out.push(Recipe {
+            name: format!("Laravel {key}{lts}{needs}"),
+            kind: "composer".into(),
+            url: None,
+            package: Some(package),
+            command: None,
+            wordpress: false,
+            pip: vec![],
+            commands: vec![],
+            run: None,
+            flask: false,
+            django: false,
+        });
+    }
+    out
+}
+
 pub fn recipes(app: &App) -> Vec<Recipe> {
     let mut list: Vec<Recipe> = serde_json::from_str(assets::QUICKAPPS_JSON).unwrap_or_default();
+    // Laravel majors found online replace the built-in pinned ones (same place in the list).
+    let found = packages::discovered_laravel(app);
+    if !found.is_empty() {
+        let at = list.iter().position(is_pinned_laravel).unwrap_or(list.len());
+        list.retain(|r| !is_pinned_laravel(r));
+        for (i, r) in found.into_iter().enumerate() {
+            list.insert((at + i).min(list.len()), r);
+        }
+    }
     let user = app.paths.usr.join("quickapps.json");
     if !user.exists() {
         let _ = fs::write(&user, "[]\n");
@@ -69,11 +137,11 @@ pub fn recipes(app: &App) -> Vec<Recipe> {
 /// php.exe and the composer.phar to run it with. Composer 2.3+ needs PHP 7.2.5, so with an
 /// older PHP an installed Composer 2.2 LTS is used instead of the active Composer.
 pub fn composer_cmd(app: &App) -> Result<(String, String)> {
-    let php = app.active("php").ok_or_else(|| anyhow::anyhow!("PHP is not installed (Tools > Quick add)."))?;
-    let active = app.active("composer").ok_or_else(|| anyhow::anyhow!("Composer is not installed (Tools > Quick add > Composer)."))?;
+    let php = app.active("php").ok_or_else(|| anyhow::anyhow!("PHP is not installed (Install page)."))?;
+    let active = app.active("composer").ok_or_else(|| anyhow::anyhow!("Composer is not installed (Install page > Composer)."))?;
     let comp = if php.key() < vec![7, 2, 5] && active.key() >= vec![2, 3] {
         app.versions("composer").into_iter().find(|c| c.key() < vec![2, 3]).ok_or_else(|| {
-            anyhow::anyhow!("PHP {} needs Composer 2.2 LTS: Tools > Quick add > Composer 2.2 LTS.", php.number())
+            anyhow::anyhow!("PHP {} needs Composer 2.2 LTS: Install page > Composer > Composer 2.2 LTS.", php.number())
         })?
     } else {
         active
@@ -188,7 +256,7 @@ fn venv_bin(venv: &Path) -> std::path::PathBuf {
 }
 
 fn python_project(app: &App, recipe: &Recipe, name: &str, target: &Path, log: Log) -> Result<()> {
-    let py = app.active("python").ok_or_else(|| anyhow::anyhow!("Python is not installed (Tools > Quick add > Python)."))?;
+    let py = app.active("python").ok_or_else(|| anyhow::anyhow!("Python is not installed (Install page > Python)."))?;
     fs::create_dir_all(target)?;
     let venv = target.join(".venv");
     log(&format!("Creating a virtual environment with Python {}…", py.number()));
@@ -241,23 +309,9 @@ fn next_app_port(app: &App) -> Result<u16> {
 
 /// Add {"<name>": {"proxy": port}} to usr/sites.json, keeping everything else in it.
 fn set_site_proxy(app: &App, name: &str, port: u16) -> Result<()> {
-    let path = app.paths().usr.join("sites.json");
-    let text = fs::read_to_string(&path).unwrap_or_default();
-    let mut all: Value = if text.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!(
-            "usr/sites.json isn't valid JSON ({e}); add \"{name}\": {{\"proxy\": {port}}} to it yourself."
-        ))?
-    };
-    let Some(obj) = all.as_object_mut() else { bail!("usr/sites.json should contain a JSON object.") };
-    let entry = obj.entry(name.to_string()).or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        *entry = json!({});
-    }
-    entry["proxy"] = json!(port);
-    fs::write(&path, serde_json::to_string_pretty(&all)? + "\n")?;
-    Ok(())
+    crate::sites::update_override(app, name, |e| {
+        e.insert("proxy".into(), json!(port));
+    })
 }
 
 /// Django only answers for hosts in ALLOWED_HOSTS and checks the origin of HTTPS form posts.

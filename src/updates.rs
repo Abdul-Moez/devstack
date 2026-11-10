@@ -67,13 +67,14 @@ pub fn php_updates(app: &App, log: Log, install: bool) -> Result<Vec<String>> {
     }
     if let Some(newest) = data.as_object().and_then(|o| o.keys().max_by_key(|k| version_key(k))) {
         if !best.contains_key(newest) {
-            notes.push(format!("PHP {newest} is available: Tools > Quick add > PHP {newest}"));
+            notes.push(format!("PHP {newest} is available on the Install page"));
         }
     }
     Ok(notes)
 }
 
-/// At most once a day (unless forced): refresh cacert.pem and add new PHP patches.
+/// At most once a day (unless forced): refresh cacert.pem, look for new series of every tool
+/// (and Laravel majors), and add new PHP patches.
 pub fn daily(app: &App, log: Log, force: bool) -> Result<Vec<String>> {
     let last = app.state.value("last_update_check").as_u64().unwrap_or(0);
     if !force && now_secs().saturating_sub(last) < 86400 {
@@ -88,6 +89,11 @@ pub fn daily(app: &App, log: Log, force: bool) -> Result<Vec<String>> {
             Ok(false) => {}
             Err(e) => log(&format!("cacert.pem update failed: {e:#}")),
         }
+    }
+    match packages::discover(app, log) {
+        Ok(0) => {}
+        Ok(n) => notes.push(format!("{n} new version{} on the Install page", if n == 1 { "" } else { "s" })),
+        Err(e) => log(&format!("Checking for new versions failed: {e:#}")),
     }
     if app.settings.bool("php.auto_update") && !app.versions("php").is_empty() {
         match php_updates(app, log, true) {

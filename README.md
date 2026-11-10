@@ -20,6 +20,12 @@ Several versions of each can sit side by side (switch with the Version dropdown)
 | Node.js | current LTS, 26, 24, 22, 20, 18, 16 |
 | Composer | latest, and 2.2 LTS (used automatically with PHP 7.0/7.1) |
 
+New releases show up on their own. Patch releases (PHP 8.4.x, Node 22.x, MySQL 8.4.x, …) are
+always the newest when you install. New series (PHP 8.6, Python 3.16, Node 28, MariaDB 13,
+PostgreSQL 19, Laravel 14, …) are found once a day, or right away with Install > Check for new
+versions (`ds discover`). The one exception is a new MySQL Innovation series, which needs a
+devstack update.
+
 Each MySQL/MariaDB series keeps its own data folder, so switching versions never touches
 another version's databases. MySQL 5.6 needs the Visual C++ 2010 runtime (`ds doctor` says
 so if it's missing).
@@ -53,6 +59,7 @@ Settings); right-clicking the tray icon gives the same actions while the window 
 | New project | New project page: Laravel (latest or 11/10/9/8/6/5.5) / WordPress / Symfony / Django / Flask / … |
 | Django or Flask | New project makes the project with its own `.venv`, starts the dev server in a console window (`run.bat` starts it again later) and https://name.test forwards to it |
 | Switch PHP / MySQL / Node version | Version dropdown on the Overview, or the Install page ("Use this one") |
+| Give a project its own versions | Sites > **Versions** on the project (e.g. PHP 7.4 + MySQL 5.7, or Node 18), then pick it in Overview > **Project** (or the tray's Project menu, or `ds project use shop`). Start all then uses its versions; "Default versions" goes back to yours |
 | Toggle a PHP extension | PHP page > Extensions |
 | php/composer/node/mysql in any terminal | Tools > PATH > Add |
 | Terminal with everything on PATH | Overview > **Terminal** |
@@ -63,6 +70,8 @@ Settings); right-clicking the tray icon gives the same actions while the window 
 
 Command line: `ds start`, `ds stop`, `ds reload`, `ds status`, `ds new Laravel shop`,
 `ds use php php-8.4.27-ts`, `ds add php-8.5`, `ds db backup`, `ds lan on`, `ds doctor`, `ds --help`.
+Projects: `ds project` (list), `ds project set shop php php-7.4.33-ts`, `ds project use shop`,
+`ds project use none`. New versions: `ds discover`.
 
 Installing a version never switches to it; pick it in the Version dropdown
 (or `ds use`) when you're ready.
