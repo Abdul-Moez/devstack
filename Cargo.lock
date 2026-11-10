@@ -1193,6 +1193,7 @@ dependencies = [
  "chrono",
  "clap",
  "eframe",
+ "flate2",
  "junction",
  "minijinja",
  "netstat2",

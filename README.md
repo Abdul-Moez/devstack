@@ -1,3 +1,5 @@
+<img src="assets/logo.png" width="88" alt="">
+
 # devstack
 
 A personal, portable Laragon-style dev environment for Windows 10/11, written in Rust.
@@ -7,7 +9,7 @@ PostgreSQL, MongoDB, Redis, Memcached, Mailpit; every folder in `www\` becomes
 
 Several versions of each can sit side by side (switch with the Version dropdown):
 
-| Tool | Versions in Quick add |
+| Tool | Versions on the Install page |
 |---|---|
 | PHP | 8.5, 8.4, 8.3, 8.2, 8.1, 8.0, 7.4, 7.3, 7.2, 7.1, 7.0 |
 | Python | 3.15, 3.14, 3.13, 3.12, 3.11, 3.10, 3.9, 3.8 (full Python with pip and venv) |
@@ -28,7 +30,7 @@ Run `devstack-setup-<version>.exe`:
 
 1. Pick a folder (default `C:\devstack`; anywhere you can write, not Program Files).
 2. Pick what to download now: Recommended = Apache, PHP 8.4, MySQL 8.4, Mailpit, Composer,
-   phpMyAdmin. Anything else can be added later from **Menu > Tools > Quick add**.
+   phpMyAdmin. Anything else can be added later on the **Install** page.
 3. Optional: desktop icon, add tools to PATH, run at Windows startup.
 
 The installed folder contains only `devstack.exe`, `ds.exe` and the uninstaller. Everything
@@ -37,29 +39,32 @@ Laragon first if it's running; both want ports 80, 443 and 3306.
 
 ## First run
 
-1. Open devstack, click **Start All**. Windows asks once to edit the hosts file.
-2. **Menu > Web server > Trust local CA** so HTTPS works without browser warnings.
-3. Create a folder in `www\`, or use **Menu > Quick app**. `www\blog` becomes https://blog.test.
+1. Open devstack, click **Start all**. Windows asks once to edit the hosts file.
+2. **Tools > Trust the local CA** so HTTPS works without browser warnings.
+3. Create a folder in `www\`, or use **New project**. `www\blog` becomes https://blog.test.
+
+The window has a sidebar (Overview, Sites, New project, Install, PHP, Databases, Tools, Logs,
+Settings); right-clicking the tray icon gives the same actions while the window is hidden.
 
 ## Everyday use
 
 | Want to… | Do |
 |---|---|
-| New project | Menu > Quick app > Laravel (latest or 11/10/9/8/6/5.5) / WordPress / Symfony / Django / Flask / … |
-| Django or Flask | Quick app makes the project with its own `.venv`, starts the dev server in a console window (`run.bat` starts it again later) and https://name.test forwards to it |
-| Switch PHP / MySQL / Node version | Version dropdown in the table, or Menu > PHP > Version |
-| Toggle a PHP extension | Menu > PHP > Extensions |
-| php/composer/node/mysql in any terminal | Menu > Tools > PATH > Add devstack to PATH |
-| Terminal with everything on PATH | **Terminal** button |
-| See caught emails | **Mail** button (Mailpit) |
-| Show a site to someone | Menu > www > Share (needs an ngrok authtoken in Preferences) |
-| Open sites from your phone on the same Wi-Fi | Preferences > General > Let other devices on my network open my sites (`ds lan on`). Off by default, so nobody else on the network can see your projects |
-| Back up / restore databases | Menu > MySQL |
+| New project | New project page: Laravel (latest or 11/10/9/8/6/5.5) / WordPress / Symfony / Django / Flask / … |
+| Django or Flask | New project makes the project with its own `.venv`, starts the dev server in a console window (`run.bat` starts it again later) and https://name.test forwards to it |
+| Switch PHP / MySQL / Node version | Version dropdown on the Overview, or the Install page ("Use this one") |
+| Toggle a PHP extension | PHP page > Extensions |
+| php/composer/node/mysql in any terminal | Tools > PATH > Add |
+| Terminal with everything on PATH | Overview > **Terminal** |
+| See caught emails | Overview > **Mail inbox** (Mailpit) |
+| Show a site to someone | Sites > Share (needs an ngrok authtoken in Settings) |
+| Open sites from your phone on the same Wi-Fi | Tools > Other devices on your network (`ds lan on`). Off by default, so nobody else on the network can see your projects |
+| Back up / restore databases | Databases page |
 
 Command line: `ds start`, `ds stop`, `ds reload`, `ds status`, `ds new Laravel shop`,
 `ds use php php-8.4.27-ts`, `ds add php-8.5`, `ds db backup`, `ds lan on`, `ds doctor`, `ds --help`.
 
-Adding a version with Quick add never switches to it; pick it in the Version dropdown
+Installing a version never switches to it; pick it in the Version dropdown
 (or `ds use`) when you're ready.
 
 ## Customizing
@@ -70,7 +75,7 @@ Adding a version with Quick add never switches to it; pick it in the Version dro
 * Any app server (Django, Flask, Node, …) behind https://name.test: `usr\sites.json` →
   `{"myapp": {"proxy": 3000}}`
 * Replace a config template: put your copy in `usr\templates\` (same path as in `assets\templates\`)
-* Quick app recipes: `usr\quickapps.json`; extra Quick add packages: `usr\packages.json`
+* New project recipes: `usr\quickapps.json`; extra Install entries: `usr\packages.json`
 
 ## Building from source
 

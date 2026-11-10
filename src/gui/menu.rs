@@ -44,6 +44,15 @@ pub enum Action {
     Terminal,
     Doctor,
     Preferences,
+    // Used by the window only (never in the tray):
+    /// Show a page: "install", "install:php", "settings:php", …
+    Page(String),
+    /// Include a service in Start all (or not).
+    Enable(String, bool),
+    /// Let other devices on the network open the sites.
+    Lan(bool),
+    /// Quick app recipe index + project name.
+    CreateProject(usize, String),
 }
 
 impl Action {
@@ -85,7 +94,7 @@ fn version_menu(app: &App, tool: &str) -> Vec<Node> {
     out
 }
 
-fn tool_label(tool: &str) -> String {
+pub fn tool_label(tool: &str) -> String {
     match tool {
         "php" => "PHP".into(),
         "mysql" => "MySQL / MariaDB".into(),
@@ -234,36 +243,6 @@ pub fn model(app: &App) -> Vec<Node> {
         Node::Sep,
         item("Exit", Action::Exit),
     ]
-}
-
-/// Render as egui menu entries; clicked actions are pushed to `out`.
-pub fn egui_menu(ui: &mut eframe::egui::Ui, nodes: &[Node], out: &mut Vec<Action>) {
-    for n in nodes {
-        match n {
-            Node::Item(label, a) => {
-                if ui.button(label).clicked() {
-                    out.push(a.clone());
-                    ui.close_menu();
-                }
-            }
-            Node::Disabled(label) => {
-                ui.add_enabled(false, eframe::egui::Button::new(label));
-            }
-            Node::Check(label, checked, a) => {
-                let mut v = *checked;
-                if ui.checkbox(&mut v, label).clicked() {
-                    out.push(a.clone());
-                    ui.close_menu();
-                }
-            }
-            Node::Sub(label, kids) => {
-                ui.menu_button(label, |ui| egui_menu(ui, kids, out));
-            }
-            Node::Sep => {
-                ui.separator();
-            }
-        }
-    }
 }
 
 /// Count entries (used by the tests and the smoke check).

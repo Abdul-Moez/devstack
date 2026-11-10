@@ -20,8 +20,8 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 3. `cargo test` must pass.
 4. `cargo run --bin devstack` (data goes to `./dev-root`, see `.cargo/config.toml`) and walk
    through: Quick add PHP 8.4 + Apache + MySQL 8.4 + Mailpit + Composer + phpMyAdmin → Start All
-   → UAC prompt for hosts → Menu > Web server > Trust local CA → create `dev-root/www/test` →
-   https://test.test works without a warning → Quick app > Laravel → Nginx switch → Stop All.
+   → UAC prompt for hosts → Tools > Trust the local CA → create `dev-root/www/test` →
+   https://test.test works without a warning → New project > Laravel → Tools > Nginx → Stop all.
 5. Check the Windows-only behaviors: tray icon (left click shows the window, right-click menu
    is current and works while the window is hidden), closing the window hides to the tray,
    single instance (second launch focuses the first), Tools > PATH add/remove, Run at startup,
@@ -54,9 +54,12 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 | `src/winutil.rs` | **All Win32 code**: UAC elevation, user PATH, autostart, junctions, show/hide window, single instance, terminals. |
 | `src/procs.rs` | Detached spawning, PID + start-time tracking in `tmp/state.json`, port owners (netstat2/sysinfo). |
 | `src/versions.rs` | `TOOLS`: tool → bin folder + executable(s). A version is any subfolder containing the exe. |
-| `src/gui/mod.rs` | Window, dialogs, preferences, background jobs (`Jobs::spawn`), ticker thread (PHP pool healing, backups, update checks). |
-| `src/gui/menu.rs` | One menu model rendered both in the window and in the tray. `Action` is serialized as the tray item id. |
+| `src/gui/mod.rs` | Window shell (sidebar, pages, modal dialogs), background jobs (`Jobs::spawn`, `spawn_keyed` for "Installing…" state), ticker thread (PHP pool healing, backups, update checks). `devstack.exe --page=install:php` opens on a page. |
+| `src/gui/pages.rs` | The pages: Overview, Sites, New project, Install, PHP, Databases, Tools, Logs, Settings. Draw from state cached in `GuiApp::refresh`, push `Action`s. |
+| `src/gui/theme.rs` | The look: palette, Windows fonts (Bahnschrift, Segoe UI, Consolas) and Segoe Fluent Icons, hand-painted widgets (buttons, toggle, status light, chips, segmented control). |
+| `src/gui/menu.rs` | The tray's native right-click menu model. `Action` (also used by the window) is serialized as the tray item id. |
 | `src/gui/tray.rs` | Tray icon (Windows only at runtime). Menu rebuilt when the pointer enters the icon. |
+| `examples/make_icons.rs` | Draws the logo (three rack units with status lights) and writes `assets/icon-*.rgba`, `devstack.ico`, `logo.png`. |
 | `src/cli.rs` | `ds` commands, plus hidden `_elevated hosts <file>` and installer helper `setup`. |
 | `installer/devstack.iss` | Inno Setup script: folder choice, component downloads (`ds setup`), PATH/autostart tasks, VC++ runtime, clean uninstall. |
 
@@ -91,6 +94,11 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
     version that was active before (`versions.<tool>`); only `switch_version` changes it.
 13. Secrets stay off command lines (ngrok gets `NGROK_AUTHTOKEN`, MySQL tools read
     `etc/mysql/client.cnf`).
+14. **The look (gui/theme.rs).** Black canvas, graphite panels, hairline borders. Signal
+    orange only for the main action of a page and for selection; green only for "running".
+    The status lights are the one bold element. No nested popup menus in the window (pages
+    instead); sentence-case copy; icons from Segoe Fluent Icons, never emoji. Check changes
+    with screenshots of the real window.
 
 ## Old versions
 

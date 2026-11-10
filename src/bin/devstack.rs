@@ -1,4 +1,7 @@
 //! `devstack.exe`: tray icon + window. No console window on Windows.
+//!
+//! Options: `--hidden` (start in the tray), `--page=<name>` (open on a page: overview, sites,
+//! new, install, install:php, php, databases, tools, logs, settings).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
@@ -9,5 +12,7 @@ fn main() {
         cli_args.extend(args.into_iter().skip(1));
         std::process::exit(devstack::cli::run(cli_args));
     }
-    std::process::exit(devstack::gui::run(args.iter().any(|a| a == "--hidden")));
+    let hidden = args.iter().any(|a| a == "--hidden");
+    let page = args.iter().find_map(|a| a.strip_prefix("--page=")).map(str::to_string);
+    std::process::exit(devstack::gui::run(hidden, page));
 }

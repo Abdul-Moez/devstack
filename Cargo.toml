@@ -57,6 +57,9 @@ windows-sys = { version = "0.59", features = [
 [build-dependencies]
 winresource = "0.1"
 
+[dev-dependencies]
+flate2 = "1" # examples/make_icons.rs: PNG compression (already in the tree via zip)
+
 [profile.release]
 opt-level = "s"
 lto = true

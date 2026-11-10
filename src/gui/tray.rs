@@ -27,8 +27,8 @@ thread_local! {
 }
 
 fn icon(running: bool) -> Option<Icon> {
-    let rgba = if running { assets::ICON_GREEN } else { assets::ICON_GREY };
-    Icon::from_rgba(rgba.to_vec(), assets::ICON_SIZE, assets::ICON_SIZE).ok()
+    let rgba = if running { assets::ICON_RUNNING } else { assets::ICON_STOPPED };
+    Icon::from_rgba(rgba.to_vec(), assets::TRAY_ICON_SIZE, assets::TRAY_ICON_SIZE).ok()
 }
 
 fn append(add: &dyn Fn(&dyn IsMenuItem), nodes: &[Node]) {
