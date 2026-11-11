@@ -6,10 +6,14 @@
 //! (Django, Flask, Node, ...) instead of serving files.
 //! `{"shop": {"versions": {"php": "php-7.4.33-ts", "mysql": "mysql-5.7.44"}}}` makes shop a
 //! project with its own versions: choosing it switches to them (see `App::set_project`).
+//!
+//! The web folder (docroot) is `public/` if the project has one, else the project folder;
+//! `"docroot": "another_folder"` picks another folder inside the project ("." = the project
+//! folder itself).
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +29,9 @@ pub struct Site {
     pub host: String,
     pub path: PathBuf,
     pub docroot: PathBuf,
+    /// The web folder chosen in usr/sites.json, relative to the project ("a/b", or "." for
+    /// the project folder). None = automatic.
+    pub docroot_rel: Option<String>,
     pub aliases: Vec<String>,
     pub ssl: bool,
     pub cert: String,
@@ -66,6 +73,101 @@ impl Site {
         }
         out
     }
+}
+
+/// A web folder from usr/sites.json, normalized to "a/b" (or "." for the project folder).
+/// It has to stay inside the project: absolute paths, drive letters and ".." are refused, and
+/// so are characters that could end the quoted path in an Apache or Nginx config.
+pub fn clean_docroot(rel: &str) -> Option<String> {
+    let rel = rel.trim().replace('\\', "/");
+    if rel == "." || rel == "./" {
+        return Some(".".into());
+    }
+    let rel = rel.trim_matches('/');
+    let ok = !rel.is_empty()
+        && rel.len() <= 200
+        && rel.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.ends_with(' ')
+                && !part.chars().any(|c| c.is_control() || matches!(c, '"' | '<' | '>' | '|' | ':' | '*' | '?' | '$' | ';' | '{' | '}'))
+        });
+    ok.then(|| rel.to_string())
+}
+
+fn join_rel(base: &Path, rel: &str) -> PathBuf {
+    if rel == "." {
+        return base.to_path_buf();
+    }
+    rel.split('/').fold(base.to_path_buf(), |p, part| p.join(part))
+}
+
+/// True if the folder has a file a web server would serve by default.
+pub fn has_index(dir: &Path) -> bool {
+    ["index.php", "index.html", "index.htm"].iter().any(|f| dir.join(f).is_file())
+}
+
+/// Folders inside a project (up to two levels down) that hold an index file, as paths relative
+/// to the project, nearest first. Dependency and hidden folders are skipped.
+pub fn docroot_candidates(project: &Path, limit: usize) -> Vec<String> {
+    const SKIP: &[&str] = &["vendor", "node_modules", "storage", "cache", "tests", "test", "docs"];
+    let mut out = vec![];
+    let mut level: Vec<(PathBuf, String)> = vec![(project.to_path_buf(), String::new())];
+    let mut visited = 0;
+    for _ in 0..2 {
+        let mut next = vec![];
+        for (dir, rel) in &level {
+            let Ok(rd) = fs::read_dir(dir) else { continue };
+            let mut names: Vec<String> = rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.') && !SKIP.contains(&n.to_lowercase().as_str()))
+                .collect();
+            names.sort_by_key(|n| n.to_lowercase());
+            for name in names {
+                visited += 1;
+                if visited > 300 {
+                    return out;
+                }
+                let path = dir.join(&name);
+                let rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                if has_index(&path) && clean_docroot(&rel).is_some() {
+                    out.push(rel.clone());
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+                next.push((path, rel));
+            }
+        }
+        level = next;
+    }
+    out
+}
+
+/// Set the folder inside a project that the web server serves (`None` = automatic).
+pub fn set_docroot(app: &App, name: &str, rel: Option<&str>) -> Result<()> {
+    let rel = match rel.map(str::trim).filter(|r| !r.is_empty()) {
+        None => None,
+        Some(r) => {
+            let clean = clean_docroot(r).ok_or_else(|| anyhow!("The web folder has to be a folder inside the project (no drive letters or \"..\")."))?;
+            let site = app.sites().into_iter().find(|s| s.name == name).ok_or_else(|| anyhow!("No project called {name} in www."))?;
+            if !join_rel(&site.path, &clean).is_dir() {
+                return Err(anyhow!("{name} has no folder called {clean}."));
+            }
+            Some(clean)
+        }
+    };
+    update_override(app, name, |e| match &rel {
+        Some(r) => {
+            e.insert("docroot".into(), json!(r));
+        }
+        None => {
+            e.remove("docroot");
+        }
+    })
 }
 
 /// Versions from a usr/sites.json entry: only known tools and plain folder names.
@@ -164,8 +266,10 @@ pub fn discover(app: &App) -> Vec<Site> {
             continue;
         }
         let path = d.path();
-        let docroot = match o.get("docroot").and_then(Value::as_str) {
-            Some(rel) => path.join(rel),
+        // An override that isn't a folder inside the project (or doesn't exist) is ignored.
+        let docroot_rel = o.get("docroot").and_then(Value::as_str).and_then(clean_docroot).filter(|rel| join_rel(&path, rel).is_dir());
+        let docroot = match &docroot_rel {
+            Some(rel) => join_rel(&path, rel),
             None if path.join("public").is_dir() => path.join("public"),
             None => path.clone(),
         };
@@ -177,7 +281,7 @@ pub fn discover(app: &App) -> Vec<Site> {
         let ssl = o.get("ssl").and_then(Value::as_bool).unwrap_or(ssl_default) && ssl_default;
         let proxy = proxy_port(o.get("proxy"));
         let versions = parse_versions(o.get("versions"));
-        sites.push(Site { name, host, path, docroot, aliases, ssl, cert: String::new(), key: String::new(), proxy, versions });
+        sites.push(Site { name, host, path, docroot, docroot_rel, aliases, ssl, cert: String::new(), key: String::new(), proxy, versions });
     }
     sites
 }

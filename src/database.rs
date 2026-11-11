@@ -85,6 +85,21 @@ impl<'a> MySqlTools<'a> {
         Ok(())
     }
 
+    /// Tell devstack the root password the databases already have (for example one set in
+    /// Laragon). Nothing changes on the server; if MySQL is running the password is tried first.
+    pub fn remember_root_password(&self, password: &str, log: Log) -> Result<()> {
+        let old = self.app.secrets.str("mysql_root_password");
+        self.app.secrets.set("mysql_root_password", json!(password))?;
+        self.app.generate(log)?;
+        if self.svc().running(self.app) && self.sql("SELECT 1").is_err() {
+            self.app.secrets.set("mysql_root_password", json!(old))?;
+            self.app.generate(log)?;
+            return Err(service_err("MySQL didn't accept that password, so the old one was kept."));
+        }
+        log("Root password saved");
+        Ok(())
+    }
+
     pub fn backup_all(&self, log: Log) -> Result<PathBuf> {
         self.require_running()?;
         let out = self.app.paths.backup.join("mysql").join(timestamp());
@@ -126,6 +141,12 @@ impl<'a> MySqlTools<'a> {
         }
         let v = self.version()?;
         let dd = mysql_data_dir(self.app, &v);
+        if crate::laragon::owns(self.app, &dd) {
+            return Err(service_err(format!(
+                "{} belongs to Laragon; devstack won't move it. Turn off \"Use Laragon's databases\" (Settings > Laragon) to start a fresh devstack data folder instead.",
+                dd.display()
+            )));
+        }
         if dd.exists() {
             let dest = self.app.paths.backup.join(format!("broken-{}-{}", dd.file_name().unwrap().to_string_lossy(), timestamp()));
             fs::create_dir_all(&self.app.paths.backup)?;

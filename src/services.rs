@@ -427,8 +427,9 @@ pub fn php_in_apache(app: &App) -> bool {
     app.settings.str("web_server") == "apache" && crate::configs::php_apache_module(app, None).is_some()
 }
 
-fn php_command(v: &Version, port: u16) -> Vec<String> {
-    vec![fwd(&v.exe), "-b".into(), format!("127.0.0.1:{port}"), "-c".into(), fwd(v.path.join("php.ini"))]
+fn php_command(app: &App, v: &Version, port: u16) -> Vec<String> {
+    let ini = crate::configs::php_ini_dir(app, v).join("php.ini");
+    vec![fwd(&v.exe), "-b".into(), format!("127.0.0.1:{port}"), "-c".into(), fwd(ini)]
 }
 
 /// Restart pool members that died. Called periodically by the GUI.
@@ -444,7 +445,7 @@ pub fn php_heal(app: &App, log: Log) -> Result<usize> {
     for (i, rec) in recs.iter_mut().enumerate() {
         if !alive(rec) {
             if let Some(port) = rec.port {
-                let mut new = spawn(&php_command(&v, port), &v.path, env.as_ref(), &Php.log_path(app, i, n))?;
+                let mut new = spawn(&php_command(app, &v, port), &v.path, env.as_ref(), &Php.log_path(app, i, n))?;
                 new.port = Some(port);
                 *rec = new;
                 fixed += 1;
@@ -488,7 +489,7 @@ impl Service for Php {
         Some(HashMap::from([
             ("PHP_FCGI_MAX_REQUESTS".into(), app.settings.u64("php.max_requests", 0).to_string()),
             ("PHP_FCGI_CHILDREN".into(), "0".into()),
-            ("PHPRC".into(), v.path.display().to_string()),
+            ("PHPRC".into(), crate::configs::php_ini_dir(app, v).display().to_string()),
             ("PHP_INI_SCAN_DIR".into(), String::new()),
         ]))
     }
@@ -499,7 +500,7 @@ impl Service for Php {
         Ok(())
     }
     fn commands(&self, app: &App, v: &Version) -> Vec<Vec<String>> {
-        php_pool_ports(app).into_iter().map(|p| php_command(v, p)).collect()
+        php_pool_ports(app).into_iter().map(|p| php_command(app, v, p)).collect()
     }
     fn annotate(&self, app: &App, recs: &mut [ProcRec]) {
         for (r, p) in recs.iter_mut().zip(php_pool_ports(app)) {
@@ -528,9 +529,11 @@ pub fn mysql_missing_runtime(v: &Version) -> Option<String> {
     (!present).then(|| format!("{} needs the Visual C++ 2010 runtime (x64). Install it from {VC2010_URL}", v.name))
 }
 
+/// The data folder for this MySQL/MariaDB series: Laragon's matching folder when "Use
+/// Laragon's databases" is on and it has one, else devstack's own data/<kind>-<series>.
 pub fn mysql_data_dir(app: &App, v: &Version) -> PathBuf {
     let prefix = if mysql_is_mariadb(v) { "mariadb" } else { "mysql" };
-    app.paths.data.join(format!("{prefix}-{}", v.series()))
+    crate::laragon::data_dir(app, prefix, &v.series()).unwrap_or_else(|| app.paths.data.join(format!("{prefix}-{}", v.series())))
 }
 
 pub fn mysql_client_cnf(app: &App) -> PathBuf {
@@ -572,6 +575,7 @@ impl Service for MySql {
         }
         fs::create_dir_all(app.paths.tmp.join("mysql"))?;
         let dd = mysql_data_dir(app, v);
+        crate::laragon::check_data_version(app, v, &dd)?;
         if dd.exists() {
             return Ok(());
         }
@@ -624,7 +628,7 @@ impl Service for MySql {
 pub struct Postgres;
 
 pub fn pg_data_dir(app: &App, v: &Version) -> PathBuf {
-    app.paths.data.join(format!("postgresql-{}", v.major()))
+    crate::laragon::data_dir(app, "postgresql", &v.major()).unwrap_or_else(|| app.paths.data.join(format!("postgresql-{}", v.major())))
 }
 
 impl Postgres {

@@ -1,6 +1,9 @@
 //! The window's pages. Each draws from the state `GuiApp::refresh` caches and pushes `Action`s;
 //! nothing here does slow work.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 use eframe::egui::{self, Align, Color32, FontId, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui};
 use serde_json::{json, Value};
@@ -16,7 +19,11 @@ use crate::util::{fwd, valid_name};
 
 /// "PHP 7.4.33", "MariaDB 11.4.13", "Node.js 20.20.2" for a project's tool + version folder.
 fn version_label(tool: &str, folder: &str) -> String {
-    let number = crate::util::parse_version(folder).unwrap_or_else(|| folder.to_string());
+    // "php-7.4.33-ts" -> 7.4.33; "node-v22" (no dots) -> 22
+    let number = crate::util::parse_version(folder).unwrap_or_else(|| {
+        let digits: String = folder.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() { folder.to_string() } else { digits }
+    });
     let name = match tool {
         "php" => "PHP",
         "mysql" if folder.contains("mariadb") => "MariaDB",
@@ -71,9 +78,10 @@ fn service_row(ui: &mut Ui, r: &Row, cols: &[f32; 6], busy: bool, apache_up: boo
                     .on_hover_text("Set by the chosen project. Change it on the Sites page, or choose Default versions.");
             } else {
                 let current = r.active.clone().unwrap_or_default();
-                egui::ComboBox::from_id_salt(("version", &r.id)).selected_text(&current).width(cols[1] - 22.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("version", &r.id)).selected_text(&current).width(cols[1] - 22.0).truncate().show_ui(ui, |ui| {
                     for v in &r.versions {
-                        if ui.selectable_label(*v == current, v).clicked() && *v != current {
+                        let text = if r.laragon.contains(v) { format!("{v}  (Laragon)") } else { v.clone() };
+                        if ui.selectable_label(*v == current, text).clicked() && *v != current {
                             actions.push(Action::Version(r.tool.clone(), v.clone()));
                         }
                     }
@@ -116,23 +124,44 @@ fn service_row(ui: &mut Ui, r: &Row, cols: &[f32; 6], busy: bool, apache_up: boo
     });
 }
 
-/// One site. Returns true when its "Versions" button was clicked (opens/closes the editor).
-fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, chosen: bool, editing: bool, busy: bool, actions: &mut Vec<Action>) -> bool {
-    let shared = sharing.filter(|r| r.site.as_deref() == Some(s.name.as_str()));
+/// What a site's row needs to know besides the site itself.
+struct SiteState<'a> {
+    sharing: Option<&'a ProcRec>,
+    /// A subfolder that holds the index file when the web folder has none.
+    hint: Option<&'a String>,
+    chosen: bool,
+    editing: bool,
+    busy: bool,
+}
+
+/// The folder a site is served from, as short as it can be said: relative to the projects
+/// folder ("shop/another_folder") when it is inside it.
+fn served_from(s: &Site) -> String {
+    let full = fwd(&s.docroot);
+    let project = fwd(&s.path);
+    match (full.strip_prefix(&project), project.rsplit('/').next()) {
+        (Some(rest), Some(name)) => format!("www/{name}{rest}"),
+        _ => full,
+    }
+}
+
+/// One site. Returns true when its "Settings" button was clicked (opens/closes the editor).
+fn site_row(ui: &mut Ui, s: &Site, st: &SiteState, actions: &mut Vec<Action>) -> bool {
+    let shared = st.sharing.filter(|r| r.site.as_deref() == Some(s.name.as_str()));
     // Both sides exist at once, so each collects its own clicks.
     let (mut left, mut right) = (vec![], vec![]);
     let mut toggle_editor = false;
     ui.add_space(10.0);
-    egui::Sides::new().show(
+    theme::sides(
         ui,
         |ui| {
             ui.vertical(|ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if theme::link(ui, s.host.clone(), theme::strong(15.0), BONE).on_hover_text(s.url()).clicked() {
                         left.push(Action::OpenUrl(s.url()));
                     }
                     ui.add_space(4.0);
-                    if chosen {
+                    if st.chosen {
                         theme::pill(ui, "Chosen project", LED_ON);
                     }
                     for tech in s.stack() {
@@ -148,7 +177,16 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, chosen: bool, edit
                         theme::pill(ui, a, SMOKE);
                     }
                 });
-                ui.label(RichText::new(fwd(&s.docroot)).font(theme::mono(12.0)).color(SMOKE));
+                ui.add(egui::Label::new(RichText::new(served_from(s)).font(theme::mono(12.0)).color(SMOKE)).truncate())
+                    .on_hover_text(fwd(&s.docroot));
+                if let Some(folder) = st.hint {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("No index file here, but there is one in {folder}.")).size(12.5).color(LED_WARN));
+                        if theme::link(ui, "Serve that folder", FontId::proportional(12.5), BONE).clicked() {
+                            left.push(Action::SaveProject(s.name.clone(), Some(folder.clone()), s.versions.clone()));
+                        }
+                    });
+                }
                 if !s.versions.is_empty() {
                     let uses: Vec<String> = s.versions.iter().map(|(t, v)| version_label(t, v)).collect();
                     ui.label(RichText::new(format!("Uses {}", uses.join(", "))).size(12.5).color(ASH));
@@ -178,17 +216,17 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, chosen: bool, edit
             } else if theme::button(ui, Kind::Ghost, Some(icon::SHARE), "", true).on_hover_text("Share: get a public link through ngrok").clicked() {
                 right.push(Action::Share(s.name.clone()));
             }
-            if theme::button(ui, if editing { Kind::Secondary } else { Kind::Ghost }, Some(icon::CODE), "Versions", true)
-                .on_hover_text("Choose the PHP, MySQL, Node.js and Python versions this project needs")
+            if theme::button(ui, if st.editing { Kind::Secondary } else { Kind::Ghost }, Some(icon::SETTINGS), "Settings", true)
+                .on_hover_text("The web folder, and the PHP, MySQL, Node.js and Python versions this project uses")
                 .clicked()
             {
                 toggle_editor = true;
             }
-            if chosen {
-                if theme::button(ui, Kind::Secondary, None, "Use defaults", !busy).on_hover_text("Go back to the default versions").clicked() {
+            if st.chosen {
+                if theme::button(ui, Kind::Secondary, None, "Use defaults", !st.busy).on_hover_text("Go back to the default versions").clicked() {
                     right.push(Action::Project(None));
                 }
-            } else if theme::button(ui, Kind::Secondary, Some(icon::PLAY), "Use this project", !busy)
+            } else if theme::button(ui, Kind::Secondary, Some(icon::PLAY), "Use this project", !st.busy)
                 .on_hover_text("Switch to this project's versions (running services restart with them)")
                 .clicked()
             {
@@ -200,6 +238,69 @@ fn site_row(ui: &mut Ui, s: &Site, sharing: Option<&ProcRec>, chosen: bool, edit
     actions.extend(right);
     ui.add_space(10.0);
     toggle_editor
+}
+
+/// The Sites page's open editor: one project's web folder and versions, not saved yet.
+pub(super) struct ProjectDraft {
+    pub name: String,
+    path: PathBuf,
+    /// None = automatic; "." = the project folder; else a folder inside the project.
+    docroot: Option<String>,
+    versions: BTreeMap<String, String>,
+    /// Subfolders that hold an index file, offered in the web folder list.
+    candidates: Vec<String>,
+    /// The project has a public folder (which is what Automatic then serves).
+    has_public: bool,
+    error: Option<String>,
+}
+
+impl ProjectDraft {
+    pub fn new(s: &Site) -> Self {
+        let mut candidates = crate::sites::docroot_candidates(&s.path, 12);
+        if let Some(d) = s.docroot_rel.as_ref().filter(|d| d.as_str() != "." && !candidates.contains(*d)) {
+            candidates.insert(0, d.clone());
+        }
+        ProjectDraft {
+            name: s.name.clone(),
+            path: s.path.clone(),
+            docroot: s.docroot_rel.clone(),
+            versions: s.versions.clone(),
+            candidates,
+            has_public: s.path.join("public").is_dir(),
+            error: None,
+        }
+    }
+
+    /// A folder picked in the folder dialog: it has to be inside the project.
+    fn pick(&mut self, picked: &Path) {
+        let base = self.path.to_string_lossy().into_owned();
+        let full = picked.to_string_lossy().into_owned();
+        // Windows paths don't care about case, and the dialog may spell the drive differently.
+        let inside = full.len() >= base.len()
+            && full.is_char_boundary(base.len())
+            && full[..base.len()].eq_ignore_ascii_case(&base)
+            && full[base.len()..].chars().next().is_none_or(|c| c == '\\' || c == '/');
+        if !inside {
+            self.error = Some("Choose a folder inside the project.".into());
+            return;
+        }
+        let rel = full[base.len()..].trim_matches(['\\', '/']).replace('\\', "/");
+        if rel.is_empty() {
+            self.docroot = if self.has_public { Some(".".into()) } else { None };
+            self.error = None;
+            return;
+        }
+        match crate::sites::clean_docroot(&rel) {
+            Some(clean) => {
+                if !self.candidates.contains(&clean) {
+                    self.candidates.push(clean.clone());
+                }
+                self.docroot = Some(clean);
+                self.error = None;
+            }
+            None => self.error = Some("That folder's name can't be used for a web folder.".into()),
+        }
+    }
 }
 
 fn recipe_hint(r: &Recipe) -> String {
@@ -281,7 +382,7 @@ impl GuiApp {
                 ui.add_space(4.0);
                 let current = self.project.clone().unwrap_or_else(|| "Default versions".into());
                 ui.add_enabled_ui(!busy, |ui| {
-                    egui::ComboBox::from_id_salt("project").selected_text(&current).width(230.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("project").selected_text(&current).width(230.0).truncate().show_ui(ui, |ui| {
                         if ui.selectable_label(self.project.is_none(), "Default versions").clicked() && self.project.is_some() {
                             actions.push(Action::Project(None));
                         }
@@ -351,7 +452,7 @@ impl GuiApp {
         });
 
         ui.add_space(22.0);
-        egui::Sides::new().show(
+        theme::sides(
             ui,
             |ui| {
                 ui.label(RichText::new("Activity").font(theme::display(17.0)).color(BONE));
@@ -407,32 +508,40 @@ impl GuiApp {
                 if i > 0 {
                     theme::hairline(ui);
                 }
-                let chosen = self.project.as_deref() == Some(s.name.as_str());
-                let editing = self.editing.as_ref().is_some_and(|(n, _)| n == &s.name);
-                if site_row(ui, s, self.sharing.as_ref(), chosen, editing, busy, actions) {
+                let editing = self.editing.as_ref().is_some_and(|d| d.name == s.name);
+                let state = SiteState {
+                    sharing: self.sharing.as_ref(),
+                    hint: self.root_hints.get(&s.name),
+                    chosen: self.project.as_deref() == Some(s.name.as_str()),
+                    editing,
+                    busy,
+                };
+                if site_row(ui, s, &state, actions) {
                     toggled = Some(s);
                 }
                 if editing {
-                    self.version_editor(ui, actions);
+                    self.project_editor(ui, actions);
                     ui.add_space(12.0);
                 }
             }
         });
         if let Some(s) = toggled {
-            let same = self.editing.as_ref().is_some_and(|(n, _)| n == &s.name);
-            self.editing = if same { None } else { Some((s.name.clone(), s.versions.clone())) };
+            let same = self.editing.as_ref().is_some_and(|d| d.name == s.name);
+            self.editing = if same { None } else { Some(ProjectDraft::new(s)) };
         }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            ui.label(theme::faint("Docroot, aliases, HTTPS and app-server proxies per site are set in usr/sites.json."));
+            ui.label(theme::faint("Aliases, another host name and HTTPS per site are set in usr/sites.json."));
             if theme::link(ui, "Edit it", FontId::proportional(13.0), ASH).clicked() {
                 actions.push(Action::Edit(paths.usr.join("sites.json")));
             }
         });
     }
 
-    /// The open project's versions: one dropdown per tool ("Default" or an installed version).
-    fn version_editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    /// The open project's settings: its web folder, and one version dropdown per tool
+    /// ("Default" or an installed version).
+    fn project_editor(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let external = self.external.clone();
         let lists: Vec<(&str, Vec<String>, Option<String>)> = crate::core::PROJECT_TOOLS
             .iter()
             .map(|t| {
@@ -440,16 +549,53 @@ impl GuiApp {
                 (*t, installed, self.app().default_version(t).map(|v| v.name))
             })
             .collect();
-        let Some((name, draft)) = self.editing.as_mut() else { return };
-        let mut close = false;
+        let Some(draft) = self.editing.as_mut() else { return };
+        let (mut close, mut pick) = (false, false);
         egui::Frame::new().fill(theme::RAISED).stroke(Stroke::new(1.0_f32, theme::STEEL)).corner_radius(10).inner_margin(Margin::same(16)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(format!("Versions for {name}")).font(theme::strong(14.5)).color(BONE));
-            ui.label(theme::muted("Choosing this project switches to these. Tools left on Default use the default version."));
-            ui.add_space(8.0);
+            ui.label(RichText::new(format!("Settings for {}", draft.name)).font(theme::strong(14.5)).color(BONE));
+
+            let auto_text = format!("Automatic ({})", if draft.has_public { "public" } else { "the project folder" });
+            let current = match draft.docroot.as_deref() {
+                None => auto_text.clone(),
+                Some(".") => "The project folder".to_string(),
+                Some(d) => d.to_string(),
+            };
+            let candidates = draft.candidates.clone();
+            let has_public = draft.has_public;
+            let docroot = &mut draft.docroot;
+            theme::setting_row(ui, "Web folder", "The folder the site is served from: the one that holds index.php", |ui| {
+                if theme::button(ui, Kind::Secondary, Some(icon::FOLDER), "Choose…", true).clicked() {
+                    pick = true;
+                }
+                egui::ComboBox::from_id_salt("project-docroot").selected_text(&current).width(260.0).truncate().show_ui(ui, |ui| {
+                    if ui.selectable_label(docroot.is_none(), &auto_text).clicked() {
+                        *docroot = None;
+                    }
+                    if has_public && ui.selectable_label(docroot.as_deref() == Some("."), "The project folder").clicked() {
+                        *docroot = Some(".".into());
+                    }
+                    for c in &candidates {
+                        if ui.selectable_label(docroot.as_ref() == Some(c), c).clicked() {
+                            *docroot = Some(c.clone());
+                        }
+                    }
+                });
+            });
+            if let Some(e) = &draft.error {
+                ui.label(RichText::new(e).size(12.5).color(LED_ERR));
+                ui.add_space(6.0);
+            }
+            theme::hairline(ui);
+            ui.add_space(10.0);
+            ui.label(RichText::new("Versions").font(theme::strong(14.0)).color(BONE));
+            ui.add_space(-4.0);
+            ui.label(RichText::new("Choosing this project switches to these. Tools left on Default use the default version.").size(12.5).color(ASH));
+            ui.add_space(4.0);
+            let versions = &mut draft.versions;
             for (tool, installed, default) in &lists {
                 ui.add_space(4.0);
-                egui::Sides::new().show(
+                theme::sides(
                     ui,
                     |ui| {
                         ui.label(RichText::new(tool_label(tool)).color(BONE));
@@ -463,14 +609,15 @@ impl GuiApp {
                             return;
                         }
                         let default_text = format!("Default ({})", default.clone().unwrap_or_default());
-                        let current = draft.get(*tool).cloned().unwrap_or_else(|| default_text.clone());
-                        egui::ComboBox::from_id_salt(("project-version", *tool)).selected_text(&current).width(260.0).show_ui(ui, |ui| {
-                            if ui.selectable_label(!draft.contains_key(*tool), &default_text).clicked() {
-                                draft.remove(*tool);
+                        let current = versions.get(*tool).cloned().unwrap_or_else(|| default_text.clone());
+                        egui::ComboBox::from_id_salt(("project-version", *tool)).selected_text(&current).width(260.0).truncate().show_ui(ui, |ui| {
+                            if ui.selectable_label(!versions.contains_key(*tool), &default_text).clicked() {
+                                versions.remove(*tool);
                             }
                             for v in installed {
-                                if ui.selectable_label(draft.get(*tool) == Some(v), v).clicked() {
-                                    draft.insert(tool.to_string(), v.clone());
+                                let text = if external.contains(v) { format!("{v}  (Laragon)") } else { v.clone() };
+                                if ui.selectable_label(versions.get(*tool) == Some(v), text).clicked() {
+                                    versions.insert(tool.to_string(), v.clone());
                                 }
                             }
                         });
@@ -479,8 +626,8 @@ impl GuiApp {
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, Kind::Primary, Some(icon::CHECK), "Save versions", true).clicked() {
-                    actions.push(Action::SaveProjectVersions(name.clone(), draft.clone()));
+                if theme::button(ui, Kind::Primary, Some(icon::CHECK), "Save", true).clicked() {
+                    actions.push(Action::SaveProject(draft.name.clone(), draft.docroot.clone(), draft.versions.clone()));
                     close = true;
                 }
                 if theme::button(ui, Kind::Ghost, None, "Cancel", true).clicked() {
@@ -488,6 +635,11 @@ impl GuiApp {
                 }
             });
         });
+        if pick {
+            if let Some(d) = rfd::FileDialog::new().set_directory(&draft.path).pick_folder() {
+                draft.pick(&d);
+            }
+        }
         if close {
             self.editing = None;
         }
@@ -643,7 +795,7 @@ impl GuiApp {
                     }
                     for v in &versions {
                         ui.add_space(2.0);
-                        egui::Sides::new().show(
+                        theme::sides(
                             ui,
                             |ui| {
                                 ui.label(RichText::new(v).color(BONE));
@@ -652,6 +804,9 @@ impl GuiApp {
                                 let dir = self.app().versions_root(&selected).join(v);
                                 if theme::button(ui, Kind::Ghost, Some(icon::FOLDER), "", true).on_hover_text("Open its folder").clicked() {
                                     actions.push(Action::OpenPath(dir));
+                                }
+                                if self.external.contains(v) {
+                                    theme::pill(ui, "Laragon", SMOKE).on_hover_text("Laragon's copy, used in place");
                                 }
                                 if active.as_deref() == Some(v.as_str()) {
                                     theme::pill(ui, "Active", LED_ON);
@@ -667,7 +822,7 @@ impl GuiApp {
                     ui.label(RichText::new("Available").font(theme::strong(13.0)).color(ASH));
                     for p in self.catalogue.iter().filter(|p| p.tool == selected) {
                         ui.add_space(2.0);
-                        egui::Sides::new().show(
+                        theme::sides(
                             ui,
                             |ui| {
                                 ui.label(RichText::new(&p.label).color(BONE));
@@ -711,6 +866,14 @@ impl GuiApp {
             }
         });
         let Some(php) = &self.php else { return };
+        if self.web == "apache" && !php.thread_safe {
+            ui.label(
+                RichText::new("With Apache, this non-thread-safe build can't serve .htaccess pretty URLs (Laravel, WordPress). Switch to Nginx in Tools, or use a thread-safe build.")
+                    .size(12.5)
+                    .color(LED_WARN),
+            );
+            ui.add_space(10.0);
+        }
         let row = self.rows.iter().find(|r| r.id == "php");
         let usr = self.app().paths.usr.clone();
         theme::panel().show(ui, |ui| {
@@ -719,7 +882,7 @@ impl GuiApp {
             theme::setting_row(ui, "Version", desc, |ui| {
                 if let Some(r) = row {
                     let current = r.active.clone().unwrap_or_default();
-                    egui::ComboBox::from_id_salt("php-version").selected_text(&current).width(240.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("php-version").selected_text(&current).width(240.0).truncate().show_ui(ui, |ui| {
                         for v in &r.versions {
                             if ui.selectable_label(*v == current, v).clicked() && *v != current && !busy {
                                 actions.push(Action::Version("php".into(), v.clone()));
@@ -791,7 +954,7 @@ impl GuiApp {
             let status = if r.up() { "Running" } else { "Stopped. Start it on the Overview page to use the tools below." };
             theme::setting_row(ui, "Version", status, |ui| {
                 let current = r.active.clone().unwrap_or_default();
-                egui::ComboBox::from_id_salt("mysql-version").selected_text(&current).width(240.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("mysql-version").selected_text(&current).width(240.0).truncate().show_ui(ui, |ui| {
                     for v in &r.versions {
                         if ui.selectable_label(*v == current, v).clicked() && *v != current && !busy {
                             actions.push(Action::Version("mysql".into(), v.clone()));
@@ -800,9 +963,22 @@ impl GuiApp {
                 });
                 theme::led(ui, if r.up() { Light::On } else { Light::Off });
             });
+            if let Some(v) = self.app().active("mysql") {
+                let dd = crate::services::mysql_data_dir(self.app(), &v);
+                let laragon = crate::laragon::owns(self.app(), &dd);
+                theme::hairline(ui);
+                let desc = if laragon { "Laragon's folder for this version, used in place" } else { "devstack's own folder for this version" };
+                theme::setting_row(ui, "Data folder", desc, |ui| {
+                    if theme::button(ui, Kind::Ghost, Some(icon::FOLDER), "", true).on_hover_text("Open it").clicked() {
+                        actions.push(Action::OpenPath(dd.clone()));
+                    }
+                    let shown = fwd(&dd);
+                    ui.add(egui::Label::new(RichText::new(&shown).font(theme::mono(12.0)).color(ASH)).truncate()).on_hover_text(&shown);
+                });
+            }
             for (title, desc, buttons) in [
                 ("Create a database", "utf8mb4, ready for a new project", vec![(icon::ADD, "Create…", Action::CreateDb)]),
-                ("Root password", "Used by phpMyAdmin and your apps", vec![(icon::COPY, "Copy", Action::CopyPw), (icon::LOCK, "Change…", Action::ChangePw)]),
+                ("Root password", "Used by phpMyAdmin and your apps. If the databases already have one (set in Laragon), enter it.", vec![(icon::COPY, "Copy", Action::CopyPw), (icon::LOCK, "Change…", Action::ChangePw), (icon::EDIT, "Enter existing…", Action::KnownPw)]),
                 ("Back up now", "Dumps every database into the backup folder", vec![(icon::DOWNLOAD, "Back up", Action::BackupNow)]),
                 ("Browse the data", "HeidiSQL, DBeaver or phpMyAdmin, whichever is installed", vec![(icon::OPEN, "Open", Action::OpenDatabase)]),
                 ("my.ini additions", "Your own [mysqld] settings", vec![(icon::EDIT, "Edit", Action::Edit(paths.usr.join("my.ini")))]),
@@ -863,7 +1039,12 @@ impl GuiApp {
                 }
             });
             theme::hairline(ui);
-            theme::setting_row(ui, "Other devices on your network", "Off: only this computer can open your sites", |ui| {
+            let lan_desc = if self.lan_on {
+                "On: anyone on your network can browse everything in www at this computer's IP address"
+            } else {
+                "Off: only this computer can open your sites"
+            };
+            theme::setting_row(ui, "Other devices on your network", lan_desc, |ui| {
                 if theme::toggle(ui, self.lan_on, !busy).clicked() {
                     actions.push(Action::Lan(!self.lan_on));
                 }
@@ -974,7 +1155,7 @@ impl GuiApp {
                 discard = true;
             }
         });
-        if let Some(t) = theme::segmented(ui, &["General", "PHP", "Ports", "Backups and sharing"], prefs.tab, true) {
+        if let Some(t) = theme::segmented(ui, &["General", "PHP", "Ports", "Backups and sharing", "Laragon"], prefs.tab, true) {
             prefs.tab = t;
         }
         ui.add_space(14.0);
@@ -1005,13 +1186,23 @@ pub(super) struct Prefs {
     token_original: String,
     pub tab: usize,
     autostart_before: bool,
+    /// A Laragon folder found on this computer (for the Laragon tab).
+    laragon_found: Option<std::path::PathBuf>,
 }
 
 impl Prefs {
     pub fn load(app: &App) -> Self {
         let v = app.settings.snapshot();
         let token = app.secrets.str("ngrok_authtoken");
-        Prefs { original: v.clone(), v, token_original: token.clone(), token, tab: 0, autostart_before: app.settings.bool("run_on_startup") }
+        Prefs {
+            original: v.clone(),
+            v,
+            token_original: token.clone(),
+            token,
+            tab: 0,
+            autostart_before: app.settings.bool("run_on_startup"),
+            laragon_found: crate::laragon::detect(app),
+        }
     }
 
     fn dirty(&self) -> bool {
@@ -1094,7 +1285,7 @@ impl Prefs {
                 theme::hairline(ui);
                 self.choice(ui, "Terminal", "Used by the Terminal button", "terminal", &["cmd", "powershell", "pwsh", "wt"]);
                 theme::hairline(ui);
-                self.check(ui, "Other devices on your network", "Let phones and other computers open your sites", "lan_access");
+                self.check(ui, "Other devices on your network", "Lets anyone on your network browse everything in www at this computer's IP address", "lan_access");
                 theme::hairline(ui);
                 self.check(ui, "Start everything when devstack opens", "", "start_all_on_launch");
                 theme::hairline(ui);
@@ -1133,6 +1324,7 @@ impl Prefs {
                     self.num(ui, &title, "", &format!("ports.{k}"), 1, 65535);
                 }
             }
+            4 => self.laragon_form(ui),
             _ => {
                 self.check(ui, "Back up databases automatically", "Only databases that are running", "backup.enabled");
                 theme::hairline(ui);
@@ -1154,6 +1346,72 @@ impl Prefs {
                 });
             }
         }
+    }
+
+    fn laragon_form(&mut self, ui: &mut Ui) {
+        let dir = self.get("laragon_dir").as_str().unwrap_or("").to_string();
+        let set = !dir.is_empty() && crate::laragon::looks_like_laragon(std::path::Path::new(&dir));
+        let mut pick = false;
+        let found = self.laragon_found.clone().filter(|f| f.display().to_string() != dir);
+        let desc = if set {
+            dir.clone()
+        } else if dir.is_empty() {
+            "Not set".to_string()
+        } else {
+            format!("{dir} (no laragon.exe there)")
+        };
+        theme::setting_row(ui, "Laragon folder", &desc, |ui| {
+            if theme::button(ui, Kind::Secondary, Some(icon::FOLDER), "Choose…", true).clicked() {
+                pick = true;
+            }
+            if let Some(f) = &found {
+                if theme::button(ui, Kind::Secondary, None, &format!("Use {}", f.display()), true).clicked() {
+                    self.set("laragon_dir", json!(f.display().to_string()));
+                }
+            }
+        });
+        if pick {
+            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                self.set("laragon_dir", json!(d.display().to_string()));
+            }
+        }
+        let www = std::path::Path::new(&dir).join("www").display().to_string();
+        let uses_www = set && self.get("www_dir").as_str() == Some(www.as_str());
+        theme::hairline(ui);
+        let www_desc = format!("Projects folder: {}", if set { www.as_str() } else { "Laragon's www" });
+        theme::setting_row(ui, "Use its projects", &www_desc, |ui| {
+            if theme::toggle(ui, uses_www, set).clicked() {
+                self.set("www_dir", json!(if uses_www { String::new() } else { www.clone() }));
+            }
+        });
+        for (title, desc, key) in [
+            (
+                "Use its installed versions",
+                "Laragon's PHP, MySQL/MariaDB, Node.js and Python appear next to devstack's, used in place. devstack keeps its own settings for them.",
+                "laragon.versions",
+            ),
+            (
+                "Use its databases",
+                "Each MySQL/MariaDB version opens Laragon's data folder for that version (mysql-8 holds 8.0). Versions Laragon has no folder for get one in devstack's own data folder.",
+                "laragon.data",
+            ),
+            (
+                "Let other versions upgrade its databases",
+                "Off: only Laragon's own MySQL/MariaDB builds open Laragon's databases. A newer build upgrades the files, and Laragon's older build may then refuse to open them.",
+                "laragon.allow_upgrade",
+            ),
+        ] {
+            theme::hairline(ui);
+            let on = self.get(key).as_bool().unwrap_or(false);
+            theme::setting_row(ui, title, desc, |ui| {
+                if theme::toggle(ui, on, set).clicked() {
+                    self.set(key, json!(!on));
+                }
+            });
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Don't run Laragon and devstack at the same time: they share ports and database folders.").size(12.5).color(LED_WARN));
+        ui.add_space(8.0);
     }
 
     fn save(&self, app: &App) -> Result<()> {

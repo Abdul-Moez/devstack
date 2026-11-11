@@ -425,9 +425,30 @@ pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, enabled: bool) 
     clicked
 }
 
+/// Left content and right-aligned controls on one row. The controls are laid out first and
+/// the left side gets the width that remains, so long text wraps (or is cut short) instead of
+/// pushing the row wider than the window, which is what `egui::Sides` does.
+pub fn sides(ui: &mut Ui, left: impl FnOnce(&mut Ui), right: impl FnOnce(&mut Ui)) {
+    let height = ui.spacing().interact_size.y;
+    let gap = ui.spacing().item_spacing.x * 2.0;
+    let mut top = ui.available_rect_before_wrap();
+    top.max.y = top.min.y + height;
+    let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(top).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    right(&mut right_ui);
+    let right_rect = right_ui.min_rect();
+    // Nothing on the right: the left side may use the whole row.
+    let left_end = if right_rect.width() > 0.0 { right_rect.min.x - gap } else { top.max.x };
+    let mut left_max = top;
+    left_max.max.x = left_end.max(top.min.x + 140.0);
+    let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_max).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    left(&mut left_ui);
+    let used = left_ui.min_rect().union(right_rect);
+    ui.advance_cursor_after_rect(used);
+}
+
 /// Page title and one line of context, with actions on the right.
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str, actions: impl FnOnce(&mut Ui)) {
-    egui::Sides::new().show(
+    sides(
         ui,
         |ui| {
             ui.vertical(|ui| {
@@ -463,7 +484,7 @@ pub fn hairline(ui: &mut Ui) {
 /// Label + description on the left, a control on the right.
 pub fn setting_row(ui: &mut Ui, title: &str, desc: &str, control: impl FnOnce(&mut Ui)) {
     ui.add_space(10.0);
-    egui::Sides::new().show(
+    sides(
         ui,
         |ui| {
             ui.vertical(|ui| {

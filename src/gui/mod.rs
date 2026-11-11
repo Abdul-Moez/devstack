@@ -46,6 +46,8 @@ pub enum Msg {
     Log(String),
     Done { quiet: bool, result: std::result::Result<Outcome, (String, Option<String>)> },
     Action(Action),
+    /// Projects whose index file sits in a subfolder: project name -> that folder.
+    RootHints(HashMap<String, String>),
 }
 
 /// Shared by the window, the tray handlers and the ticker thread.
@@ -135,8 +137,8 @@ fn background(jobs: &Jobs, action: &Action) -> bool {
         }),
         Action::Version(tool, name) => jobs.spawn(true, false, move |app, log| app.switch_version(&tool, &name, log).map(|_| Outcome::Nothing)),
         Action::Project(name) => jobs.spawn(true, false, move |app, log| app.set_project(name.as_deref(), log).map(|_| Outcome::Nothing)),
-        Action::SaveProjectVersions(name, versions) => {
-            jobs.spawn(true, false, move |app, log| app.save_project_versions(&name, &versions, log).map(|_| Outcome::Nothing))
+        Action::SaveProject(name, docroot, versions) => {
+            jobs.spawn(true, false, move |app, log| app.save_project_settings(&name, docroot.as_deref(), &versions, log).map(|_| Outcome::Nothing))
         }
         Action::Discover => jobs.spawn_keyed("discover".into(), |app, log| {
             if packages::discover(app, log)? == 0 {
@@ -305,6 +307,8 @@ struct Row {
     active: Option<String>,
     /// The chosen project sets this tool's version.
     overridden: bool,
+    /// Versions that are Laragon's (used in place).
+    laragon: Vec<String>,
 }
 
 impl Row {
@@ -324,6 +328,7 @@ struct PhpInfo {
 enum InputThen {
     CreateDb,
     ChangePw,
+    KnownPw,
 }
 
 enum ConfirmThen {
@@ -331,6 +336,7 @@ enum ConfirmThen {
     ForceStopAll { then_exit: bool },
     Recover,
     Restore(PathBuf),
+    UseLaragon(PathBuf),
 }
 
 enum Dialog {
@@ -359,8 +365,13 @@ pub struct GuiApp {
     installed: HashMap<String, (Vec<String>, Option<String>)>,
     project: Option<String>,
     project_versions: BTreeMap<String, String>,
+    /// Names of installed versions that are Laragon's.
+    external: HashSet<String>,
     /// Sites page: the project whose versions are being edited, with the draft.
-    editing: Option<(String, BTreeMap<String, String>)>,
+    editing: Option<pages::ProjectDraft>,
+    /// Sites page: projects whose index file is in a subfolder (found off the UI thread).
+    root_hints: HashMap<String, String>,
+    hints_at: Option<Instant>,
     ssl_on: bool,
     lan_on: bool,
     web: String,
@@ -430,7 +441,10 @@ impl GuiApp {
             installed: HashMap::new(),
             project: None,
             project_versions: BTreeMap::new(),
+            external: HashSet::new(),
             editing: None,
+            root_hints: HashMap::new(),
+            hints_at: None,
             ssl_on: false,
             lan_on: false,
             web: String::new(),
@@ -450,6 +464,22 @@ impl GuiApp {
         me.refresh();
         if let Some(p) = page {
             me.go(&p);
+        }
+        let app = me.jobs.app.clone();
+        if !app.settings.bool("laragon.asked") && crate::laragon::root(&app).is_none() {
+            if let Some(found) = crate::laragon::detect(&app) {
+                me.dialog = Some(Dialog::Confirm {
+                    title: "Laragon found".into(),
+                    text: format!(
+                        "devstack found Laragon at {}. Use its projects (www), its installed PHP, MySQL, Node.js and Python versions, and its databases?
+
+They're used in place; devstack doesn't change Laragon's folders. Don't run Laragon and devstack at the same time. You can change this later in Settings > Laragon.",
+                        found.display()
+                    ),
+                    yes: "Use Laragon's folders".into(),
+                    then: ConfirmThen::UseLaragon(found),
+                });
+            }
         }
         me
     }
@@ -481,7 +511,7 @@ impl GuiApp {
             (Page::Install, Some(tool)) => self.install_tool = tool,
             (Page::Sites, Some(project)) => {
                 if let Some(s) = self.sites.iter().find(|s| s.name == project) {
-                    self.editing = Some((s.name.clone(), s.versions.clone()));
+                    self.editing = Some(pages::ProjectDraft::new(s));
                 }
             }
             (Page::Settings, Some(tab)) => {
@@ -491,6 +521,7 @@ impl GuiApp {
                     "php" => 1,
                     "ports" => 2,
                     "backups" | "sharing" => 3,
+                    "laragon" => 4,
                     _ => 0,
                 };
             }
@@ -530,6 +561,7 @@ impl GuiApp {
                     versions: app.versions(s.tool()).into_iter().map(|v| v.name).collect(),
                     active: app.active(s.tool()).map(|v| v.name),
                     overridden: self.project_versions.contains_key(s.tool()),
+                    laragon: app.versions(s.tool()).into_iter().filter(|v| v.external).map(|v| v.name).collect(),
                 };
                 any_up |= row.up();
                 row
@@ -543,7 +575,9 @@ impl GuiApp {
         self.catalogue = packages::catalogue(&app);
         self.recipes = quickapp::recipes(&app);
         self.installed.clear();
+        self.external.clear();
         for p in &self.catalogue {
+            self.external.extend(app.versions(&p.tool).into_iter().filter(|v| v.external).map(|v| v.name));
             self.installed
                 .entry(p.tool.clone())
                 .or_insert_with(|| (app.versions(&p.tool).into_iter().map(|v| v.name).collect(), app.active(&p.tool).map(|v| v.name)));
@@ -565,6 +599,24 @@ impl GuiApp {
         });
         self.last_refresh = Instant::now();
         tray::set_running(any_up);
+    }
+
+    /// Look, off the UI thread, for projects whose web folder has no index file while one of
+    /// their subfolders does (the Sites page offers to serve that folder).
+    fn scan_root_hints(&mut self) {
+        self.hints_at = Some(Instant::now());
+        let jobs = self.jobs.clone();
+        std::thread::spawn(move || {
+            let hints: HashMap<String, String> = jobs
+                .app
+                .sites()
+                .into_iter()
+                .filter(|s| s.proxy.is_none() && s.docroot_rel.is_none() && !crate::sites::has_index(&s.docroot))
+                .filter_map(|s| crate::sites::docroot_candidates(&s.path, 1).into_iter().next().map(|folder| (s.name, folder)))
+                .collect();
+            let _ = jobs.tx.send(Msg::RootHints(hints));
+            jobs.ctx.request_repaint();
+        });
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
@@ -602,8 +654,10 @@ impl GuiApp {
             match msg {
                 Msg::Log(m) => self.push_log(m),
                 Msg::Action(a) => self.dispatch(ctx, a),
+                Msg::RootHints(hints) => self.root_hints = hints,
                 Msg::Done { quiet, result } => {
                     self.refresh();
+                    self.hints_at = None; // something changed: look again
                     match result {
                         Ok(o) => self.outcome(ctx, o),
                         Err((msg, force)) => {
@@ -717,6 +771,15 @@ impl GuiApp {
                     then: InputThen::ChangePw,
                 });
             }
+            Action::KnownPw => {
+                self.dialog = Some(Dialog::Input {
+                    title: "Existing root password".into(),
+                    prompt: "The root password your databases already use".into(),
+                    value: String::new(),
+                    password: true,
+                    then: InputThen::KnownPw,
+                });
+            }
             Action::CopyPw => {
                 ctx.copy_text(self.app().secrets.str("mysql_root_password"));
                 self.jobs.log("MySQL root password copied to the clipboard");
@@ -746,6 +809,9 @@ impl GuiApp {
             InputThen::ChangePw => {
                 self.jobs.spawn(false, false, move |app, log| database::MySqlTools::new(app).change_root_password(&value, log).map(|_| Outcome::Nothing));
             }
+            InputThen::KnownPw => {
+                self.jobs.spawn(false, false, move |app, log| database::MySqlTools::new(app).remember_root_password(&value, log).map(|_| Outcome::Nothing));
+            }
             _ => {}
         }
     }
@@ -758,6 +824,7 @@ impl GuiApp {
             }
             ConfirmThen::Recover => self.jobs.spawn(true, false, |app, log| Ok(Outcome::Recovered(database::MySqlTools::new(app).recover(log)?))),
             ConfirmThen::Restore(p) => self.jobs.spawn(true, false, move |app, log| database::MySqlTools::new(app).restore(&p, log).map(|_| Outcome::Nothing)),
+            ConfirmThen::UseLaragon(p) => self.jobs.spawn(true, false, move |app, log| crate::laragon::use_all(app, &p, log).map(|_| Outcome::Nothing)),
         }
     }
 
@@ -901,6 +968,8 @@ impl GuiApp {
                         self.confirm_done(then);
                     } else if let ConfirmThen::ForceStopAll { then_exit: true } = then {
                         self.quit(ctx);
+                    } else if let ConfirmThen::UseLaragon(_) = then {
+                        let _ = self.app().settings.set("laragon.asked", json!(true)); // don't ask again
                     }
                 }
                 _ => {}
@@ -958,6 +1027,9 @@ impl eframe::App for GuiApp {
         if self.last_refresh.elapsed() > Duration::from_secs(2) {
             self.refresh();
             tray::refresh_menu(&self.jobs);
+        }
+        if self.page == Page::Sites && self.hints_at.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
+            self.scan_root_hints();
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1052,6 +1124,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "stop_all_on_exit", "php.children", "php.memory_limit", "php.upload_max_filesize", "php.post_max_size",
     "php.max_execution_time", "php.timezone", "php.build", "php.auto_update", "php.auto_switch", "ports",
     "backup.enabled", "backup.interval_hours", "backup.keep", "quick_app.create_database", "quick_app.open_browser", "updates.cacert",
+    "laragon_dir", "laragon.versions", "laragon.data", "laragon.allow_upgrade",
 ];
 
 fn get_dotted(v: &Value, key: &str) -> Value {
@@ -1060,6 +1133,7 @@ fn get_dotted(v: &Value, key: &str) -> Value {
 
 // ------------------------------------------------------------------------- entry point
 pub fn run(start_hidden: bool, page: Option<String>) -> i32 {
+    winutil::keep_std_handles_private();
     let app = match App::new(None) {
         Ok(a) => Arc::new(a),
         Err(e) => {

@@ -53,6 +53,9 @@ fn client() -> &'static Client {
     C.get_or_init(|| {
         Client::builder()
             .user_agent(UA)
+            // Also refuses a redirect from https:// to http://: several downloads have no
+            // published checksum, so the connection is what vouches for them.
+            .https_only(true)
             .connect_timeout(Duration::from_secs(30))
             .timeout(None)
             .build()
@@ -164,7 +167,7 @@ pub fn catalogue(app: &App) -> Vec<Package> {
     let found: Vec<Package> = load_json(&discovered_path(app))
         .and_then(|v| serde_json::from_value(v["packages"].clone()).ok())
         .unwrap_or_default();
-    for p in found {
+    for p in found.into_iter().filter(trusted_discovered) {
         if !items.iter().any(|i| i.id == p.id) {
             let at = insert_position(&items, &p);
             items.insert(at, p);
@@ -180,6 +183,33 @@ pub fn catalogue(app: &App) -> Vec<Package> {
         }
     }
     items
+}
+
+/// A series or major the way the sources write it: "8.6", "3.16", "28".
+fn plain_series(s: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\d{1,3}(\.\d{1,3})?$").unwrap()).is_match(s)
+}
+
+/// tmp/discovered.json is written by `discover`, but it is still a file on disk. Only entries
+/// of the exact shapes `discover` writes are accepted from it; anything else (another source
+/// type, a URL, odd names) is ignored. Your own entries belong in usr/packages.json.
+fn trusted_discovered(p: &Package) -> bool {
+    let series = match p.source.get("series").or_else(|| p.source.get("major")) {
+        Some(Value::String(x)) => x.trim_end_matches('.').to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => return false,
+    };
+    let known_pair = matches!(
+        (p.tool.as_str(), s(&p.source, "type")),
+        ("php", "php") | ("python", "python") | ("nodejs", "node") | ("mysql", "mariadb") | ("postgresql", "postgresql") | ("mongodb", "mongodb")
+    );
+    known_pair
+        && plain_series(&series)
+        && safe_file_name(&p.id)
+        && p.label.len() <= 60
+        && !p.label.chars().any(char::is_control)
+        && p.source.as_object().is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "type" | "series" | "major")))
 }
 
 /// Version of an entry's series ("8.6", 28, …) for ordering; empty for "lts"/"newest" entries.
@@ -220,7 +250,27 @@ fn discovered_path(app: &App) -> PathBuf {
 
 /// The Laravel recipes found by the last `discover` (empty if it never ran).
 pub fn discovered_laravel(app: &App) -> Vec<crate::quickapp::Recipe> {
-    load_json(&discovered_path(app)).and_then(|v| serde_json::from_value(v["laravel"].clone()).ok()).unwrap_or_default()
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static PACKAGE: OnceLock<Regex> = OnceLock::new();
+    let name = NAME.get_or_init(|| Regex::new(r"^Laravel \d{1,3}(\.\d)?( LTS)?( \(PHP \d{1,2}\.\d{1,2}\+\))?$").unwrap());
+    let package = PACKAGE.get_or_init(|| Regex::new(r"^laravel/laravel:(\^\d{1,3}\.0|5\.\d\.\*)$").unwrap());
+    let all: Vec<crate::quickapp::Recipe> =
+        load_json(&discovered_path(app)).and_then(|v| serde_json::from_value(v["laravel"].clone()).ok()).unwrap_or_default();
+    // Only plain "composer create-project laravel/laravel:<version>" recipes are taken from
+    // this generated file: never a command, a URL or pip packages.
+    all.into_iter()
+        .filter(|r| {
+            r.kind == "composer"
+                && name.is_match(&r.name)
+                && r.package.as_deref().is_some_and(|p| package.is_match(p))
+                && r.url.is_none()
+                && r.command.is_none()
+                && r.run.is_none()
+                && r.pip.is_empty()
+                && r.commands.is_empty()
+                && !r.wordpress
+        })
+        .collect()
 }
 
 fn pkg(id: String, label: String, tool: &str, source: Value) -> Package {
@@ -246,13 +296,13 @@ pub fn new_packages(
     };
     let series_of_version = |v: &str| v.split('.').take(2).collect::<Vec<_>>().join(".");
     if let Some(o) = php.and_then(Value::as_object) {
-        for s in o.keys().filter(|s| version_key(s).len() == 2) {
+        for s in o.keys().filter(|s| plain_series(s) && s.contains('.')) {
             add(pkg(format!("php-{s}"), format!("PHP {s} (latest patch)"), "php", json!({"type": "php", "series": s})));
         }
     }
     if let Some(list) = nuget.and_then(|v| v["versions"].as_array()) {
         for s in list.iter().filter_map(Value::as_str).filter(|v| !v.contains('-')).map(series_of_version) {
-            if version_key(&s) >= vec![3, 8] {
+            if plain_series(&s) && version_key(&s) >= vec![3, 8] {
                 add(pkg(format!("python-{s}"), format!("Python {s}"), "python", json!({"type": "python", "series": s})));
             }
         }
@@ -272,6 +322,9 @@ pub fn new_packages(
     if let Some(list) = mariadb.and_then(|v| v["major_releases"].as_array()) {
         for r in list.iter().filter(|r| s(r, "release_status") == "Stable") {
             let id = s(r, "release_id");
+            if !plain_series(id) {
+                continue;
+            }
             let lts = s(r, "release_support_type").contains("Long Term");
             add(pkg(format!("mariadb-{id}"), format!("MariaDB {id}{}", if lts { " LTS" } else { "" }), "mysql", json!({"type": "mariadb", "series": id})));
         }
@@ -279,13 +332,16 @@ pub fn new_packages(
     if let Some(list) = postgres.and_then(Value::as_array) {
         for r in list.iter().filter(|r| r["supported"].as_bool().unwrap_or(false)) {
             let major = r["major"].to_string().trim_matches('"').to_string();
+            if !plain_series(&major) {
+                continue;
+            }
             add(pkg(format!("postgresql-{major}"), format!("PostgreSQL {major}"), "postgresql", json!({"type": "postgresql", "major": major})));
         }
     }
     if let Some(list) = mongo.and_then(|v| v["versions"].as_array()) {
         for v in list.iter().filter(|v| v["production_release"].as_bool().unwrap_or(false)) {
             let series = series_of_version(s(v, "version"));
-            if version_key(&series) >= vec![6, 0] {
+            if plain_series(&series) && version_key(&series) >= vec![6, 0] {
                 add(pkg(format!("mongodb-{series}"), format!("MongoDB {series}"), "mongodb", json!({"type": "mongodb", "series": format!("{series}.")})));
             }
         }

@@ -36,7 +36,8 @@ pub fn update_cacert(app: &App, log: Log) -> Result<bool> {
 pub fn php_updates(app: &App, log: Log, install: bool) -> Result<Vec<String>> {
     let (_, data) = packages::php_releases()?;
     let mut best: HashMap<String, Vec<u64>> = HashMap::new();
-    for v in app.versions("php") {
+    // Only PHP that devstack installed: Laragon's copies are Laragon's to update.
+    for v in app.versions("php").into_iter().filter(|v| !v.external) {
         let e = best.entry(v.series()).or_default();
         if v.key() > *e {
             *e = v.key();

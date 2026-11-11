@@ -46,6 +46,47 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The Windows system folder (C:\Windows\System32), asked from Windows itself. The admin
+/// helper uses this instead of %SystemRoot% or PATH, which whoever started it could have set.
+#[cfg(windows)]
+pub fn system_dir() -> PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n > 0 && n < buf.len() {
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    } else {
+        PathBuf::from(r"C:\Windows\System32")
+    }
+}
+
+#[cfg(not(windows))]
+pub fn system_dir() -> PathBuf {
+    PathBuf::from("/usr/bin")
+}
+
+/// Stop child processes from inheriting this process's own stdin/stdout/stderr. Services are
+/// started with their output going to a log file, but Windows hands a child every inheritable
+/// handle the parent has, including the pipe `ds start | more` writes to; the service then
+/// keeps that pipe open and whatever reads it waits until the service stops. Children that
+/// are meant to share our output still do: Rust passes them their own copies.
+#[cfg(windows)]
+pub fn keep_std_handles_private() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    let handles = [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()];
+    for h in handles {
+        if !h.is_null() {
+            unsafe {
+                SetHandleInformation(h as _, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn keep_std_handles_private() {}
+
 // ------------------------------------------------------------------ elevation
 /// Run a command through a UAC prompt and wait for it. Returns its exit code (1223 if the
 /// user clicked No).
@@ -163,6 +204,30 @@ pub fn vc_runtime_version() -> Option<(u32, u32, u32)> {
 
 #[cfg(not(windows))]
 pub fn vc_runtime_version() -> Option<(u32, u32, u32)> {
+    None
+}
+
+/// Whether the built-in groups that include every account on the PC (Users, Authenticated
+/// Users, Everyone) may write to `path`. None if it couldn't be checked.
+#[cfg(windows)]
+pub fn others_can_write(path: &Path) -> Option<bool> {
+    // The path travels in an environment variable, so nothing in it is read as script.
+    const SCRIPT: &str = "$r=[System.Security.AccessControl.FileSystemRights]; $w=[int]($r::WriteData -bor $r::AppendData); \
+        $n=@((Get-Acl -LiteralPath $env:DS_ACL_PATH).Access | Where-Object { $_.AccessControlType -eq 'Allow' -and \
+        (@('S-1-5-11','S-1-5-32-545','S-1-1-0') -contains $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value) -and \
+        (([int]$_.FileSystemRights -band $w) -ne 0) }).Count; Write-Output $n";
+    let powershell = system_dir().join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+    let mut c = crate::util::command(powershell, ["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    c.env("DS_ACL_PATH", path);
+    let out = crate::util::run(c, std::time::Duration::from_secs(20)).ok()?;
+    if !out.ok() {
+        return None;
+    }
+    out.stdout.trim().parse::<u32>().ok().map(|n| n > 0)
+}
+
+#[cfg(not(windows))]
+pub fn others_can_write(_path: &Path) -> Option<bool> {
     None
 }
 
@@ -329,7 +394,9 @@ pub fn open_console(script: &Path, cwd: &Path, env: &std::collections::HashMap<S
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x10;
-        Command::new("cmd.exe").arg("/k").arg(script).current_dir(cwd).env_clear().envs(env)
+        // Started as the script itself, not as `cmd /k <path>`: Rust then quotes the path for
+        // cmd.exe, so an `&` in a folder name can't be read as a second command.
+        Command::new(script).current_dir(cwd).env_clear().envs(env)
             .creation_flags(CREATE_NEW_CONSOLE).spawn().context("couldn't open a console")?;
         Ok(())
     }

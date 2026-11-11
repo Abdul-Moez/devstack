@@ -286,7 +286,7 @@ fn python_project(app: &App, recipe: &Recipe, name: &str, target: &Path, log: Lo
     }
     if let Some(run) = &recipe.run {
         fs::write(target.join("run.bat"), format!(
-            "@echo off\r\nrem Dev server for https://{host} (devstack forwards it to port {port})\r\ncd /d \"%~dp0\"\r\ncall .venv\\Scripts\\activate.bat\r\n{}\r\n",
+            "@echo off\r\nrem Dev server for https://{host} (devstack forwards it to port {port})\r\ncd /d \"%~dp0\"\r\ncall .venv\\Scripts\\activate.bat\r\n{}\r\nif errorlevel 1 pause\r\n",
             run.replace("{port}", &port.to_string())
         ))?;
         log(&format!("Dev server: run.bat in the project folder (port {port}). https://{host} forwards to it."));

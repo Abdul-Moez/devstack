@@ -1,5 +1,10 @@
 //! A local certificate authority plus one certificate per site, so https://name.test works
 //! without warnings once the CA is trusted (Windows asks you to confirm once).
+//!
+//! The CA carries X.509 name constraints: it can only vouch for the local zones devstack
+//! uses (.test, localhost, your own host names) and for 127.0.0.1. Its private key sits
+//! unencrypted in etc/ssl/ca/; if that file is ever copied, it still can't be used to
+//! impersonate real websites to this computer.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +13,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SerialNumber,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa,
+    KeyPair, KeyUsagePurpose, NameConstraints, SerialNumber,
 };
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -37,12 +42,36 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "this computer".into())
 }
 
-/// Creates the CA once; returns (cert PEM, key PEM).
-pub fn ensure_ca(paths: &Paths) -> Result<(String, String)> {
-    let (crt, key) = ca_files(paths);
-    if crt.exists() && key.exists() {
-        return Ok((fs::read_to_string(&crt)?, fs::read_to_string(&key)?));
+/// Top-level names that only exist for local use: one zone covers every site under them.
+const LOCAL_TLDS: &[&str] = &["test", "localhost", "local", "example", "invalid", "internal", "lan", "home", "corp"];
+
+/// The DNS zone the CA must be allowed to sign for, for one host name. `suffix` is the fixed
+/// end of the host name template ("test" for "{name}.test", "dev.acme.com" for
+/// "{name}.dev.acme.com").
+pub fn zone_for(host: &str, suffix: &str) -> String {
+    let host = host.trim_start_matches("*.").to_lowercase();
+    let tld = host.rsplit('.').next().unwrap_or("");
+    if LOCAL_TLDS.contains(&tld) {
+        tld.to_string()
+    } else if !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}"))) {
+        suffix.to_string()
+    } else {
+        host
     }
+}
+
+fn ca_meta(paths: &Paths) -> PathBuf {
+    paths.ssl.join("ca").join("devstack-ca.json")
+}
+
+/// Zones the current CA may sign for (None for a CA made before it had constraints).
+pub fn ca_zones(paths: &Paths) -> Option<Vec<String>> {
+    let v = crate::util::load_json(&ca_meta(paths))?;
+    Some(v["zones"].as_array()?.iter().filter_map(|z| z.as_str().map(str::to_string)).collect())
+}
+
+fn create_ca(paths: &Paths, zones: &[String]) -> Result<(String, String)> {
+    let (crt, key) = ca_files(paths);
     let kp = KeyPair::generate()?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
@@ -51,6 +80,13 @@ pub fn ensure_ca(paths: &Paths) -> Result<(String, String)> {
     params.distinguished_name = dn;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+    // Only these zones, and only the loopback addresses.
+    let mut permitted: Vec<GeneralSubtree> = zones.iter().map(|z| GeneralSubtree::DnsName(z.clone())).collect();
+    permitted.push(GeneralSubtree::IpAddress(CidrSubnet::V4([127, 0, 0, 0], [255, 0, 0, 0])));
+    let mut loopback6 = [0u8; 16];
+    loopback6[15] = 1;
+    permitted.push(GeneralSubtree::IpAddress(CidrSubnet::V6(loopback6, [0xff; 16])));
+    params.name_constraints = Some(NameConstraints { permitted_subtrees: permitted, excluded_subtrees: vec![] });
     params.serial_number = Some(serial());
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
@@ -59,7 +95,42 @@ pub fn ensure_ca(paths: &Paths) -> Result<(String, String)> {
     fs::create_dir_all(crt.parent().unwrap())?;
     fs::write(&key, kp.serialize_pem())?;
     fs::write(&crt, cert.pem())?;
+    fs::write(ca_meta(paths), serde_json::to_string_pretty(&json!({"zones": zones}))?)?;
     Ok((cert.pem(), kp.serialize_pem()))
+}
+
+/// Creates the CA once (for .test and localhost); returns (cert PEM, key PEM).
+pub fn ensure_ca(paths: &Paths) -> Result<(String, String)> {
+    let (crt, key) = ca_files(paths);
+    if crt.exists() && key.exists() {
+        return Ok((fs::read_to_string(&crt)?, fs::read_to_string(&key)?));
+    }
+    create_ca(paths, &["localhost".to_string(), "test".to_string()])
+}
+
+/// Make sure the CA may sign for every one of `hosts`. Returns true if the CA had to be made
+/// again (a host in a zone it didn't cover, or a CA from before constraints existed): the new
+/// one has to be trusted again. The old key is overwritten, so the old CA is dead even if
+/// Windows still lists it.
+pub fn ensure_ca_covers(paths: &Paths, hosts: &[String], suffix: &str) -> Result<bool> {
+    let mut zones: Vec<String> = hosts.iter().map(|h| zone_for(h, suffix)).collect();
+    zones.extend(["localhost".to_string(), "test".to_string()]);
+    zones.sort();
+    zones.dedup();
+    let (crt, key) = ca_files(paths);
+    let existed = crt.exists() && key.exists();
+    if existed {
+        if let Some(have) = ca_zones(paths) {
+            if zones.iter().all(|z| have.contains(z)) {
+                return Ok(false);
+            }
+            zones.extend(have);
+            zones.sort();
+            zones.dedup();
+        }
+    }
+    create_ca(paths, &zones)?;
+    Ok(existed)
 }
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {

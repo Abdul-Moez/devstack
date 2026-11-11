@@ -75,10 +75,17 @@ enum Cmd {
     ///   ds project                          show the chosen project and every project's versions
     ///   ds project use <name> | none        switch to a project's versions (none = defaults)
     ///   ds project set <name> <tool> <version|default>   e.g. ds project set shop php php-7.4.33-ts
+    ///   ds project root <name> <folder|default>          the folder inside the project that holds index.php
     #[command(verbatim_doc_comment)]
     Project { action: Option<String>, name: Option<String>, tool: Option<String>, version: Option<String> },
     /// Look for new versions of every tool (and new Laravel majors) now.
     Discover,
+    /// Use an existing Laragon's projects, installed versions and databases (in place).
+    ///   ds laragon                show what's found and what's in use
+    ///   ds laragon on [folder]    use it (folder defaults to the one found)
+    ///   ds laragon off            back to devstack's own folders
+    #[command(verbatim_doc_comment)]
+    Laragon { action: Option<String>, folder: Option<PathBuf> },
     /// Check for updates now: new versions, PHP patches, cacert.pem.
     Update,
     /// Check the setup.
@@ -109,6 +116,9 @@ enum DbCmd {
     Create { name: String },
     List,
     Password { new: String },
+    /// Tell devstack the root password the databases already have (nothing changes on the server).
+    #[command(name = "known-password")]
+    KnownPassword { password: String },
     Backup,
     Recover,
 }
@@ -127,6 +137,7 @@ fn confirm(question: &str) -> bool {
 
 /// Parse args and run. Returns the process exit code.
 pub fn run(args: Vec<String>) -> i32 {
+    crate::winutil::keep_std_handles_private();
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
@@ -134,6 +145,14 @@ pub fn run(args: Vec<String>) -> i32 {
             return if e.use_stderr() { 2 } else { 0 };
         }
     };
+    // The UAC helper runs with admin rights. It does its one job before anything else is
+    // loaded: no settings, no folders created, nothing read from devstack's folder.
+    if let Cmd::Elevated { task, arg } = &cli.cmd {
+        return match task.as_str() {
+            "hosts" => hosts::apply_staged(std::path::Path::new(arg)).unwrap_or(1),
+            _ => 2,
+        };
+    }
     let app = match App::new(cli.root.clone()) {
         Ok(a) => a,
         Err(e) => {
@@ -152,12 +171,7 @@ pub fn run(args: Vec<String>) -> i32 {
 
 fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Elevated { task, arg } => {
-            return match task.as_str() {
-                "hosts" => hosts::apply_staged(app, &PathBuf::from(arg)),
-                _ => Ok(2),
-            };
-        }
+        Cmd::Elevated { .. } => return Ok(2), // handled in run(), before App is created
         Cmd::Start { ids } => {
             if ids.is_empty() {
                 return Ok(if app.start_all(&log)?.is_empty() { 0 } else { 1 });
@@ -208,6 +222,32 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
             }
             log(&format!("  project: {}", app.project().unwrap_or_else(|| "none (default versions)".into())));
         }
+        Cmd::Laragon { action, folder } => match action.as_deref() {
+            None => {
+                match crate::laragon::detect(app) {
+                    Some(r) => log(&format!("Laragon: {}", r.display())),
+                    None => log(r"No Laragon found (looked above devstack's folder and in C:\laragon … G:\laragon)."),
+                }
+                let on = |b: bool| if b { "yes" } else { "no" };
+                log(&format!("  projects folder: {}", app.paths().www.display()));
+                log(&format!("  using its versions: {}   using its databases: {}", on(crate::laragon::versions_on(app)), on(crate::laragon::data_on(app))));
+                for tool in ["php", "mysql", "nodejs", "python"] {
+                    let theirs: Vec<String> = app.versions(tool).into_iter().filter(|v| v.external).map(|v| v.name).collect();
+                    if !theirs.is_empty() {
+                        log(&format!("  {tool}: {}", theirs.join(", ")));
+                    }
+                }
+                if let Some(v) = app.active("mysql") {
+                    log(&format!("  MySQL data folder for {}: {}", v.name, crate::services::mysql_data_dir(app, &v).display()));
+                }
+            }
+            Some("on") => {
+                let root = folder.or_else(|| crate::laragon::detect(app)).ok_or_else(|| anyhow!("No Laragon found. Use: ds laragon on <folder>"))?;
+                crate::laragon::use_all(app, &root, &log)?;
+            }
+            Some("off") => crate::laragon::stop_using(app, &log)?,
+            Some(other) => return Err(anyhow!("Unknown action '{other}'. Use: ds laragon | ds laragon on [folder] | ds laragon off")),
+        },
         Cmd::Discover => {
             let n = packages::discover(app, &log)?;
             log(&if n == 0 { "No new versions since the last check.".to_string() } else { format!("{n} new version(s) added; see ds packages.") });
@@ -246,7 +286,16 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
                 }
                 app.save_project_versions(&n, &versions, &log)?;
             }
-            Some(other) => return Err(anyhow!("Unknown action '{other}'. Use: ds project | use | set")),
+            Some("root") => {
+                let (Some(n), Some(folder)) = (name, tool) else {
+                    return Err(anyhow!("Use: ds project root <name> <folder|default>"));
+                };
+                crate::sites::set_docroot(app, &n, if folder == "default" { None } else { Some(folder.as_str()) })?;
+                app.reload(&log)?;
+                let site = app.sites().into_iter().find(|s| s.name == n).ok_or_else(|| anyhow!("No project called {n} in www."))?;
+                log(&format!("{} is served from {}", site.host, site.docroot.display()));
+            }
+            Some(other) => return Err(anyhow!("Unknown action '{other}'. Use: ds project | use | set | root")),
         },
         Cmd::Sites => {
             for s in app.sites() {
@@ -346,6 +395,7 @@ fn dispatch(app: &App, cmd: Cmd) -> Result<i32> {
                     }
                 }
                 DbCmd::Password { new } => t.change_root_password(&new, &log)?,
+                DbCmd::KnownPassword { password } => t.remember_root_password(&password, &log)?,
                 DbCmd::Backup => database::auto_backup(app, &log, true)?,
                 DbCmd::Recover => {
                     if confirm("Move the current MySQL data folder aside and start with an empty one?") {

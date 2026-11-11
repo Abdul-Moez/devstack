@@ -26,8 +26,7 @@ pub fn hosts_path() -> PathBuf {
 
 fn system_hosts_path() -> PathBuf {
     if IS_WIN {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        PathBuf::from(root).join("System32").join("drivers").join("etc").join("hosts")
+        winutil::system_dir().join("drivers").join("etc").join("hosts")
     } else {
         PathBuf::from("/etc/hosts")
     }
@@ -116,6 +115,8 @@ pub fn sync(app: &App, hosts: &[String], log: Log) -> Result<bool> {
         backup(app, &path)?;
         write(&path, &new)?;
     } else {
+        // The backup is made here, without admin rights; the helper only writes the hosts file.
+        backup(app, &path)?;
         let staged = app.paths().tmp.join("hosts.new");
         fs::write(&staged, &new)?;
         log("Updating the hosts file (Windows will ask for permission)…");
@@ -128,12 +129,16 @@ pub fn sync(app: &App, hosts: &[String], log: Log) -> Result<bool> {
     Ok(true)
 }
 
-/// Runs inside the elevated helper process. Refuses changes outside our block and block
-/// lines that aren't `127.0.0.1 <host>`.
-pub fn apply_staged(app: &App, staged: &Path) -> Result<i32> {
-    // With admin rights, only ever touch the real hosts file: DEVSTACK_HOSTS is a testing
-    // aid and must not let the helper write anywhere else.
+/// Runs inside the elevated helper process, so it does one thing and trusts nothing it is
+/// given: it reads the staged file, refuses changes outside devstack's block and block lines
+/// that aren't `127.0.0.1 <host>`, and writes the real hosts file. It never loads settings,
+/// creates folders or writes anywhere in devstack's own (user-writable) folder, and it finds
+/// Windows' files through the system, not through environment variables or PATH.
+pub fn apply_staged(staged: &Path) -> Result<i32> {
     let path = if IS_WIN { system_hosts_path() } else { hosts_path() };
+    if fs::metadata(staged)?.len() > 1024 * 1024 {
+        return Ok(4);
+    }
     let new = fs::read_to_string(staged)?.replace("\r\n", "\n");
     if with_block(&new, "") != with_block(&read(&path)?, "") {
         return Ok(2);
@@ -141,10 +146,10 @@ pub fn apply_staged(app: &App, staged: &Path) -> Result<i32> {
     if !block_is_safe(&new) {
         return Ok(3);
     }
-    backup(app, &path)?;
     write(&path, &new)?;
     if IS_WIN {
-        let _ = crate::util::run(crate::util::command("ipconfig", ["/flushdns"]), std::time::Duration::from_secs(15));
+        let ipconfig = winutil::system_dir().join("ipconfig.exe");
+        let _ = crate::util::run(crate::util::command(ipconfig, ["/flushdns"]), std::time::Duration::from_secs(15));
     }
     Ok(0)
 }

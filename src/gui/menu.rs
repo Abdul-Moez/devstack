@@ -55,8 +55,11 @@ pub enum Action {
     CreateProject(usize, String),
     /// Switch to a project's versions (None = the defaults). Also in the tray.
     Project(Option<String>),
-    /// Save a project's versions (tool -> version folder; missing = default).
-    SaveProjectVersions(String, BTreeMap<String, String>),
+    /// Save a project's settings: name, web folder (None = automatic), versions (tool ->
+    /// version folder; missing = default).
+    SaveProject(String, Option<String>, BTreeMap<String, String>),
+    /// Enter the root password the databases already have.
+    KnownPw,
     /// Look for new versions of every tool and new Laravel majors.
     Discover,
 }

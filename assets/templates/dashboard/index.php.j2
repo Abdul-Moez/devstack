@@ -1,10 +1,16 @@
 <?php
 // devstack dashboard (shown at http://localhost). To change it, copy this template to
 // usr/templates/dashboard/index.php.j2 and edit the copy.
-if (isset($_GET['phpinfo'])) { phpinfo(); exit; }
+// Pages that reveal this computer's setup are only shown to this computer. That matters when
+// "Other devices on your network" is on.
+$local = in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true);
+if (isset($_GET['phpinfo'])) {
+    if (!$local) { http_response_code(403); exit('phpinfo() is only shown on this computer.'); }
+    phpinfo(); exit;
+}
 
-$www = '{{ www }}';
-$template = '{{ hostname_template }}';
+$www = '{{ www | php }}';
+$template = '{{ hostname_template | php }}';
 $https = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
 $scheme = $https ? 'https' : 'http';
 $sites = [];
@@ -50,9 +56,11 @@ function e($s) { return htmlspecialchars($s, ENT_QUOTES); }
     <div class="meta">PHP <?= e(PHP_VERSION) ?> · <?= e($_SERVER['SERVER_SOFTWARE'] ?? '') ?></div>
   </header>
   <nav class="links">
+    <?php if ($local): ?>
     <a href="?phpinfo=1">phpinfo()</a>
     <?php if ($pma): ?><a href="/phpmyadmin/">phpMyAdmin</a><?php endif; ?>
     <a href="http://127.0.0.1:{{ mailpit_ui }}/">Mailpit inbox</a>
+    <?php endif; ?>
   </nav>
   <h2>Projects in www</h2>
   <ul>

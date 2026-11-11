@@ -53,6 +53,16 @@ pub fn php_apache_module(app: &App, v: Option<&Version>) -> Option<(PathBuf, &'s
         .find(|(p, _)| p.exists())
 }
 
+/// Where a PHP version's php.ini goes: next to php.exe for devstack's own versions (so `php` on
+/// PATH finds it), under etc/php/<version>/ for Laragon's, whose folders devstack never writes to.
+pub fn php_ini_dir(app: &App, v: &Version) -> PathBuf {
+    if v.external {
+        app.paths.etc.join("php").join(&v.name)
+    } else {
+        v.path.clone()
+    }
+}
+
 pub fn php_available_extensions(v: &Version) -> Vec<String> {
     let mut out: Vec<String> = fs::read_dir(v.path.join("ext"))
         .map(|rd| {
@@ -100,6 +110,8 @@ fn environment(app: &App) -> Environment<'static> {
     env.set_keep_trailing_newline(true);
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_auto_escape_callback(|_| AutoEscape::None);
+    // {{ x | php }}: safe inside a single-quoted PHP string (a path with an apostrophe, …).
+    env.add_filter("php", |v: String| v.replace('\\', "\\\\").replace('\'', "\\'"));
     let usr = app.paths.usr.join("templates");
     env.set_loader(move |name| {
         let p = usr.join(name);
@@ -111,6 +123,40 @@ fn environment(app: &App) -> Environment<'static> {
         Ok(assets::template(name).map(str::to_string))
     });
     env
+}
+
+/// Ports for the templates, always as numbers: a hand-edited settings.json can't put text
+/// (and with it extra config lines) where a port goes.
+fn ports(app: &App) -> Value {
+    let defaults = crate::settings::defaults();
+    let mut out = serde_json::Map::new();
+    if let Some(o) = app.settings.get("ports").as_object() {
+        for (k, v) in o {
+            if defaults["ports"].get(k).is_some() {
+                out.insert(k.clone(), json!(app.settings.port(k)));
+            } else if let Some(n) = v.as_u64().and_then(|n| u16::try_from(n).ok()) {
+                out.insert(k.clone(), json!(n));
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Settings that end up on one config line, with line breaks and control characters removed.
+fn one_line(v: Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.chars().filter(|c| !c.is_control()).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, one_line(v))).collect()),
+        other => other,
+    }
+}
+
+/// This computer's name, if it is a plain host name: the catch-all site answers to it too, so
+/// http://my-pc/ works from the network. A website can't claim that name for itself.
+fn computer_name() -> String {
+    let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default().to_lowercase();
+    let plain = !name.is_empty() && name.len() <= 63 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if plain { name } else { String::new() }
 }
 
 fn pma_secret(app: &App) -> Result<String> {
@@ -139,7 +185,8 @@ pub fn context(app: &App, sites: &[Site]) -> Result<Value> {
         "root": fwd(&p.root), "www": fwd(&p.www), "etc": fwd(&p.etc), "logs": fwd(&p.logs),
         "tmp": fwd(&p.tmp), "data": fwd(&p.data), "usr": fwd(&p.usr), "ssl_dir": fwd(&p.ssl),
         "dashboard_dir": fwd(p.etc.join("dashboard")),
-        "ports": s.get("ports"),
+        "ports": ports(app),
+        "computer_name": computer_name(),
         // Web servers listen on 127.0.0.1 only, unless the user lets other devices in.
         // Listening everywhere would let anyone on the same Wi-Fi browse www/ (incl. .env files).
         "bind": if s.bool("lan_access") { "" } else { "127.0.0.1:" },
@@ -151,7 +198,7 @@ pub fn context(app: &App, sites: &[Site]) -> Result<Value> {
             "ssl": x.ssl, "cert": x.cert, "key": x.key,
             "proxy": x.proxy.map(|p| format!("http://127.0.0.1:{p}")).unwrap_or_default(),
         })).collect::<Vec<_>>(),
-        "php": s.get("php"),
+        "php": one_line(s.get("php")),
         // PHP 7.0/7.1 only understand "extension=php_curl.dll", not "extension=curl".
         "php_ext_dll": php.as_ref().is_some_and(|v| v.key() < vec![7, 2]),
         // serialize_precision = -1 exists since PHP 7.1.
@@ -159,15 +206,16 @@ pub fn context(app: &App, sites: &[Site]) -> Result<Value> {
         "php_ports": php_pool_ports(app),
         "hostname_template": s.str("hostname_template"),
         "cacert": if cacert.exists() { fwd(&cacert) } else { String::new() },
-        "mailpit_smtp": s.get("ports.mailpit_smtp"),
-        "mailpit_ui": s.get("ports.mailpit_ui"),
-        "mysql_port": s.get("ports.mysql"),
+        "mailpit_smtp": s.port("mailpit_smtp"),
+        "mailpit_ui": s.port("mailpit_ui"),
+        "mysql_port": s.port("mysql"),
         "mysql_password": app.secrets.str("mysql_root_password"),
         "phpmyadmin_secret": pma_secret(app)?,
         "usr_php_ini": read_text(&p.usr.join("php.ini")),
         "usr_my_ini": read_text(&p.usr.join("my.ini")),
         "usr_redis_conf": read_text(&p.usr.join("redis.conf")),
         "apache_dir": dir("apache"), "nginx_dir": dir("nginx"), "php_dir": dir("php"),
+        "php_ini_dir": php.as_ref().map(|v| fwd(php_ini_dir(app, v))).unwrap_or_default(),
         "mysql_dir": dir("mysql"), "phpmyadmin_dir": dir("phpmyadmin"),
         "apache_modules": apache_modules,
         "php_extensions": exts,
@@ -191,7 +239,7 @@ pub fn outputs(app: &App) -> Vec<(&'static str, &'static str, PathBuf)> {
         out.push(("nginx", "nginx/sites.conf.j2", p.etc.join("nginx").join("sites.conf")));
     }
     if let Some(php) = app.active("php") {
-        out.push(("php", "php/php.ini.j2", php.path.join("php.ini")));
+        out.push(("php", "php/php.ini.j2", php_ini_dir(app, &php).join("php.ini")));
     }
     if app.active("mysql").is_some() {
         out.push(("mysql", "mysql/my.ini.j2", p.etc.join("mysql").join("my.ini")));

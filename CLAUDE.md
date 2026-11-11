@@ -14,6 +14,13 @@ Steps 1-3 are done (2026-11-09): it builds on Windows with no errors or clippy w
 `cargo test` passes, and `ds status` / `ds doctor` / `ds add composer phpmyadmin` work.
 Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 
+Live-tested on Windows (2026-11-11) with Laragon's Apache 2.4.62, Nginx 1.27.3 and PHP 8.3.16
+on ports 18080/18443 in dev-root: Apache with PHP as a module, Nginx with the php-cgi pool,
+switching between them while running, HTTPS with the name-constrained CA (OpenSSL and
+Schannel accept it), a project web folder, dotfile blocking, the host-name guard, stop.
+Still untested: MySQL/MariaDB and the other databases actually starting, the UAC hosts
+helper end to end, the tray, the installer.
+
 1. Toolchain: `winget install Rustlang.Rustup` and the MSVC build tools
    (`winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`).
 2. `cargo build`, then `cargo clippy --all-targets` (keep it warning-free).
@@ -43,9 +50,10 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
 | `src/core.rs` | `App`: start_all / stop_all / reload / switch_version / set_web_server / set_ssl / projects (`set_project`, `save_project_versions`, project-aware `active`) / PATH / doctor. The CLI and GUI only call this. |
 | `src/services.rs` | `Service` trait (default methods do port checks, spawn, health check, stop) + one struct per program: Apache, Nginx, Php (php-cgi pool), MySql, Postgres, Mongo, Redis, Memcached, Mailpit. |
 | `src/configs.rs` | Renders `assets/templates/*.j2` (minijinja) into `etc/` (php.ini into the PHP folder). Returns which services' configs changed. |
-| `src/sites.rs` | Each folder in `www/` → a site (`{name}.test`, `public/` docroot if present, `usr/sites.json` overrides; `"proxy": <port>` forwards the site to an app server). |
+| `src/sites.rs` | Each folder in `www/` → a site (`{name}.test`; docroot = `public/` if present, else the folder, or `"docroot"` in `usr/sites.json`: a folder inside the project, validated by `clean_docroot`; `"proxy": <port>` forwards the site to an app server; `"versions"` makes it a project). |
 | `src/hosts.rs` | Owns one marked block in the hosts file; writes through a UAC helper only when it changed. |
-| `src/ssl.rs` | Local CA + per-site certs (rcgen), trust via `certutil -user`. |
+| `src/laragon.rs` | Working with an existing Laragon in place: its www, its versions (`Version.external`), its data folders; detection; the database-upgrade guard. |
+| `src/ssl.rs` | Local CA + per-site certs (rcgen), trust via `certutil -user`. The CA has X.509 name constraints (local zones + loopback only); `ensure_ca_covers` remakes it when a site needs a new zone. |
 | `src/packages.rs` | Quick add: resolvers → download → checksum → extract to `bin/<tool>/<folder>/`. `discover` finds new series + Laravel majors (tmp/discovered.json). Sources: php (releases.json, archive folder for 7.0-7.3), mysql (walks cdn.mysql.com patches), python (official NuGet package, SHA-512), mariadb (REST API, SHA-256), node, composer (`lts` = 2.2), github, go, phpmyadmin, postgresql, mongodb, scrape, url (`urls` = mirrors). |
 | `src/updates.rs` | Daily: newest PHP patch per installed series, cacert.pem refresh. |
 | `src/database.rs` | MySQL tools (create db, root password, backups, recover/restore), PostgreSQL backup, scheduled backups. |
@@ -109,6 +117,28 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
     page button) adds new series to tmp/discovered.json and Laravel majors from Packagist;
     `catalogue()`/`recipes()` merge them. Odd Node majors only while newest. MySQL LTS entries
     walk cdn.mysql.com for newer patches (`"type": "mysql"`); never scrape dev.mysql.com.
+17. **Laragon's folders are read, never written.** Versions with `external: true` are used in
+    place: php.ini goes to `etc/php/<version>/` (`configs::php_ini_dir`), phpMyAdmin is never
+    taken from Laragon (devstack writes its config), Recover refuses Laragon's data folder,
+    and only Laragon's own MySQL/MariaDB builds open its databases unless
+    `laragon.allow_upgrade` is on (`laragon::check_data_version`). PHP auto-update ignores
+    external versions. `laragon::owns` excludes devstack's own root (dev-root sits inside
+    Laragon's www on this machine).
+18. **Security invariants** (audit of 2026-11-11; keep them when changing these areas):
+    * The elevated helper (`cli::run` → `hosts::apply_staged`) runs before `App::new`, reads
+      one staged file, writes only the real hosts file, finds Windows' files with
+      `winutil::system_dir()` (never env vars or PATH), and makes no backup itself.
+    * The catch-all localhost vhost rejects any Host that isn't `localhost`, the computer's
+      own name or an IP literal (DNS rebinding); phpMyAdmin and phpinfo are loopback-only.
+    * `packages::client()` is `https_only` (no https→http redirects).
+    * tmp/discovered.json is trusted only for the shapes `discover` writes
+      (`trusted_discovered`, the filters in `discovered_laravel`).
+    * Values that reach config templates are numbers (`configs::ports`), single lines
+      (`one_line`), validated names, or escaped (`| php` in PHP strings).
+    * `usr/sites.json` docroot must stay inside the project (`sites::clean_docroot`).
+    * Spawned services don't inherit ds's own stdio (`winutil::keep_std_handles_private`).
+    * Scripts are started as the script itself, never `cmd /k <path>` (an `&` in a path).
+      The Windows Terminal option is the one exception: it has to go through wt.exe.
 
 ## Old versions
 
@@ -147,5 +177,11 @@ Laragon also uses ports 80, 443, 3306, 1025 and 8025; quit it before step 4.
   test folder and a fake hosts file.
 * `ds doctor` after changes; failing services include their last log lines in the error.
 * **Anything that runs `prepare` (start, reload, set_project, quick app) syncs the hosts
-  file.** In tests and when trying things against dev-root, set `DEVSTACK_HOSTS` to a fake
-  file first, or Windows will ask for admin rights to edit the real one.
+  file.** In tests use the `fake_hosts(&root)` helper in tests/basics.rs; when trying things
+  against dev-root, set `DEVSTACK_HOSTS` to a fake file first, or Windows will ask for admin
+  rights to edit the real one.
+* Real servers without touching the machine: turn on `ds laragon on` in dev-root (Laragon's
+  binaries), set test ports (18080/18443) and `www_dir` "" in dev-root/settings.json, keep
+  `laragon.data` false, start single services (`ds start apache`), never plain `ds start`
+  (that would open Laragon's databases).
+* GUI changes: check with screenshots of the real window (`devstack.exe --page=<name>`).

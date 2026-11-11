@@ -104,8 +104,16 @@ impl App {
         self.services.iter().find(|s| s.tool() == tool).map(|b| b.as_ref())
     }
 
+    /// Installed versions, newest first: devstack's own plus Laragon's (when that's turned on).
     pub fn versions(&self, tool: &str) -> Vec<Version> {
-        versions::list(&self.paths.bin, tool)
+        let mut all = versions::list(&self.paths.bin, tool);
+        for v in crate::laragon::versions(self, tool) {
+            if !all.iter().any(|x| x.name == v.name) {
+                all.push(v);
+            }
+        }
+        versions::sort(&mut all);
+        all
     }
 
     pub fn versions_root(&self, tool: &str) -> PathBuf {
@@ -154,7 +162,18 @@ impl App {
     }
 
     // ------------------------------------------------------------------ config
-    fn prepare_ssl(&self, sites: &mut [Site]) -> Result<bool> {
+    fn prepare_ssl(&self, sites: &mut [Site], log: Log) -> Result<bool> {
+        // The CA is limited to the zones the sites live in; widen it first if a site needs that.
+        let mut hosts: Vec<String> = vec![];
+        for s in sites.iter().filter(|s| s.ssl) {
+            hosts.push(s.host.clone());
+            hosts.extend(s.aliases.iter().cloned());
+        }
+        let template = self.settings.str("hostname_template").to_lowercase();
+        let suffix = template.split_once("{name}.").map(|(_, rest)| rest.to_string()).unwrap_or_default();
+        if ssl::ensure_ca_covers(&self.paths, &hosts, &suffix)? {
+            log("The local certificate authority was made again (it only vouches for your local host names). Trust it once more: Tools > Trust the local CA.");
+        }
         let mut changed = ssl::ensure_cert(&self.paths, "localhost", &["localhost".into(), "127.0.0.1".into()])?.2;
         for s in sites.iter_mut().filter(|s| s.ssl) {
             let mut names = vec![s.host.clone(), format!("*.{}", s.host)];
@@ -167,9 +186,9 @@ impl App {
         Ok(changed)
     }
 
-    fn generate_with_sites(&self) -> Result<(HashSet<String>, Vec<Site>)> {
+    fn generate_with_sites(&self, log: Log) -> Result<(HashSet<String>, Vec<Site>)> {
         let mut sites = self.sites();
-        let ssl_changed = if self.settings.bool("ssl") { self.prepare_ssl(&mut sites)? } else { false };
+        let ssl_changed = if self.settings.bool("ssl") { self.prepare_ssl(&mut sites, log)? } else { false };
         let mut changed = configs::generate(self, &sites)?;
         if ssl_changed {
             changed.insert("apache".into());
@@ -179,8 +198,8 @@ impl App {
     }
 
     /// Render all configs. Returns ids of services whose config changed.
-    pub fn generate(&self, _log: Log) -> Result<HashSet<String>> {
-        Ok(self.generate_with_sites()?.0)
+    pub fn generate(&self, log: Log) -> Result<HashSet<String>> {
+        Ok(self.generate_with_sites(log)?.0)
     }
 
     /// Everything that must happen before services start or reload.
@@ -191,7 +210,7 @@ impl App {
             }
         }
         php_plan_ports(self)?;
-        let (changed, sites) = self.generate_with_sites()?;
+        let (changed, sites) = self.generate_with_sites(log)?;
         let names: Vec<String> = sites.iter().flat_map(|s| std::iter::once(s.host.clone()).chain(s.aliases.iter().cloned())).collect();
         if let Err(e) = hosts::sync(self, &names, log) {
             log(&format!("WARNING: {e:#}"));
@@ -393,6 +412,19 @@ impl App {
         Ok(())
     }
 
+    /// Save a project's web folder and versions, then apply them: the web server picks up the
+    /// folder, and if it's the chosen project its versions are switched to.
+    pub fn save_project_settings(&self, name: &str, docroot: Option<&str>, versions: &BTreeMap<String, String>, log: Log) -> Result<()> {
+        sites::set_docroot(self, name, docroot)?;
+        sites::set_versions(self, name, versions)?;
+        log(&format!("Saved the settings for {name}"));
+        if self.project().as_deref() == Some(name) {
+            self.set_project(Some(name), log)
+        } else {
+            self.reload(log)
+        }
+    }
+
     /// Save a project's versions; if it's the chosen project, switch to them right away.
     pub fn save_project_versions(&self, name: &str, versions: &BTreeMap<String, String>, log: Log) -> Result<()> {
         sites::set_versions(self, name, versions)?;
@@ -497,7 +529,7 @@ impl App {
         env.insert("PATH".into(), format!("{}{}{}", ours.join(path_sep()), path_sep(), old));
         env.insert("COMPOSER_HOME".into(), self.paths.usr.join("composer").display().to_string());
         if let Some(php) = self.active("php") {
-            env.insert("PHPRC".into(), php.path.display().to_string());
+            env.insert("PHPRC".into(), configs::php_ini_dir(self, &php).display().to_string());
         }
         env
     }
@@ -576,6 +608,15 @@ impl App {
         }
         if self.active("ngrok").is_some() {
             out.push((!self.secrets.str("ngrok_authtoken").is_empty(), "ngrok authtoken set".into()));
+        }
+        if winutil::others_can_write(&self.paths.root) == Some(true) {
+            out.push((
+                true,
+                format!(
+                    "Note: other Windows accounts on this PC can change files in {} (devstack's programs, passwords, databases). Fine on a PC only you use; on a shared one, move devstack into your user folder.",
+                    self.paths.root.display()
+                ),
+            ));
         }
         out
     }

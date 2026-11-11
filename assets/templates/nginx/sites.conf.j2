@@ -16,9 +16,20 @@ server {
     root "{{ www }}";
     index index.php index.html index.htm /__devstack/index.php;
 
+    # This catch-all host answers only when it is addressed as localhost, by this computer's
+    # name or by IP address. Any other name means a web page pointed a domain of its own at
+    # this computer ("DNS rebinding") so that its scripts could read your projects and
+    # phpMyAdmin through your browser.
+    if ($host !~* "^(localhost{% if computer_name %}|{{ computer_name }}(\.local)?{% endif %}|[0-9.]+|\[[0-9a-f:.]+\])$") {
+        return 403;
+    }
+
     location ^~ /__devstack/ {
         alias "{{ dashboard_dir }}/";
         location ~ \.php$ {
+            if (!-f $request_filename) {
+                return 404;
+            }
 {{ php_block("$request_filename") }}
         }
     }
@@ -31,6 +42,9 @@ server {
         allow ::1;
         deny all;
         location ~ \.php$ {
+            if (!-f $request_filename) {
+                return 404;
+            }
 {{ php_block("$request_filename") }}
         }
     }

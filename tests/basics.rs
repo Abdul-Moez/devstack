@@ -14,6 +14,19 @@ fn temp_root() -> PathBuf {
     p
 }
 
+/// For tests that start, reload or switch things (all of which sync the hosts file): points
+/// devstack at a fake hosts file inside `root`, and keeps other such tests from changing the
+/// variable meanwhile. Without it devstack would ask Windows for admin rights to edit the
+/// real hosts file.
+fn fake_hosts(root: &Path) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let file = root.join("hosts");
+    fs::write(&file, "127.0.0.1 localhost\n").unwrap();
+    std::env::set_var("DEVSTACK_HOSTS", &file);
+    (guard, file)
+}
+
 fn touch(p: &Path) {
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(p, "").unwrap();
@@ -465,12 +478,7 @@ fn laravel_versions_come_from_packagist() {
 #[test]
 fn projects_choose_their_own_versions() {
     let root = temp_root();
-    // Choosing a project syncs the hosts file: use a fake one, never the real one (writing
-    // that would ask Windows for admin rights).
-    let fake_hosts = root.join("hosts");
-    fs::write(&fake_hosts, "127.0.0.1 localhost
-").unwrap();
-    std::env::set_var("DEVSTACK_HOSTS", &fake_hosts);
+    let (_hosts_guard, fake_hosts) = fake_hosts(&root);
     let app = App::new(Some(root.clone())).unwrap();
     app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
     for v in ["php-8.4.14-ts", "php-7.4.33-ts"] {
@@ -521,4 +529,271 @@ fn projects_choose_their_own_versions() {
     versions.insert("php".to_string(), "../../evil".to_string());
     assert!(app.save_project_versions("legacy", &versions, &|_| {}).is_err(), "unsafe names are refused");
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn web_folder_can_be_another_folder_inside_the_project() {
+    use devstack::sites::{clean_docroot, docroot_candidates, set_docroot};
+    for (given, want) in [("another_folder", "another_folder"), ("src\\public\\", "src/public"), ("/web/", "web"), (".", "."), ("o'brien", "o'brien")] {
+        assert_eq!(clean_docroot(given).as_deref(), Some(want), "{given}");
+    }
+    for bad in ["", "..", "../other", "a/../../b", "C:\\Windows", "a\"\nInclude evil.conf", "a\nb", "x;y", "a/$host", "a/./b"] {
+        assert_eq!(clean_docroot(bad), None, "{bad:?} must be refused");
+    }
+
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    touch(&root.join("www/shop/another_folder/index.php"));
+    touch(&root.join("www/shop/vendor/pkg/index.php"));
+    touch(&root.join("www/shop/deep/web/index.html"));
+    fs::create_dir_all(root.join("www/blog/public")).unwrap();
+    touch(&root.join("www/blog/index.php"));
+    let site = |name: &str| app.sites().into_iter().find(|s| s.name == name).unwrap();
+
+    assert!(site("shop").docroot.ends_with("shop"), "the project folder stays the default");
+    assert_eq!(docroot_candidates(&site("shop").path, 10), ["another_folder", "deep/web"], "nearest first, vendor skipped");
+
+    set_docroot(&app, "shop", Some("another_folder")).unwrap();
+    assert!(site("shop").docroot.ends_with("another_folder"));
+    assert_eq!(site("shop").docroot_rel.as_deref(), Some("another_folder"));
+    assert!(set_docroot(&app, "shop", Some("missing")).is_err(), "the folder has to exist");
+    assert!(set_docroot(&app, "shop", Some("..")).is_err());
+    assert!(site("shop").docroot.ends_with("another_folder"), "a refused change leaves the old one");
+
+    // "." picks the project folder even when public/ exists.
+    assert!(site("blog").docroot.ends_with("public"));
+    set_docroot(&app, "blog", Some(".")).unwrap();
+    assert!(site("blog").docroot.ends_with("blog"));
+    set_docroot(&app, "blog", None).unwrap();
+    assert!(site("blog").docroot.ends_with("public"));
+
+    // A hand-written override that points outside the project is ignored.
+    fs::write(root.join("usr/sites.json"), r#"{"shop": {"docroot": "../../Windows"}, "blog": {"docroot": "C:/Windows"}}"#).unwrap();
+    assert!(site("shop").docroot.ends_with("shop") && site("blog").docroot.ends_with("public"));
+
+    // The web servers get the chosen folder.
+    touch(&root.join("bin/apache/apache-2.4.70/bin").join(exe("httpd")));
+    set_docroot(&app, "shop", Some("another_folder")).unwrap();
+    app.generate(&|_| {}).unwrap();
+    assert!(fs::read_to_string(root.join("etc/apache/sites.conf")).unwrap().contains("/www/shop/another_folder\""));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A folder that looks like a Laragon installation with PHP, two MySQL builds and data.
+fn fake_laragon(dir: &Path) {
+    touch(&dir.join("laragon.exe"));
+    touch(&dir.join("bin/php/php-8.3.16-Win32-vs16-x64").join(exe("php-cgi")));
+    touch(&dir.join("bin/php/php-8.3.16-Win32-vs16-x64/ext/php_curl.dll"));
+    touch(&dir.join("bin/mysql/mysql-8.0.30-winx64/bin").join(exe("mysqld")));
+    touch(&dir.join("bin/mysql/mysql-8.4.3-winx64/bin").join(exe("mysqld")));
+    touch(&dir.join("bin/nodejs/node-v22").join(exe("node")));
+    fs::create_dir_all(dir.join("data/mysql-8/mysql")).unwrap();
+    fs::create_dir_all(dir.join("data/mysql-8/shopdb")).unwrap();
+    fs::create_dir_all(dir.join("www/oldsite")).unwrap();
+}
+
+/// Every file under `dir` with its size, to prove nothing was written there.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            out.push((path, e.metadata().map(|m| m.len()).unwrap_or(0)));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn laragon_folders_are_used_in_place_and_never_written_to() {
+    use devstack::laragon;
+    use devstack::services::mysql_data_dir;
+    let root = temp_root();
+    let (_hosts_guard, _) = fake_hosts(&root);
+    let lara = root.join("laragon");
+    fake_laragon(&lara);
+    let dev = root.join("devstack");
+    let app = App::new(Some(dev.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    let before = snapshot(&lara);
+
+    assert!(app.versions("php").is_empty(), "nothing is used until it is turned on");
+    assert!(laragon::detect(&app).is_some_and(|p| p.ends_with("laragon")), "a Laragon next to devstack's folder is found");
+    assert!(laragon::use_all(&app, &root.join("nope"), &|_| {}).is_err(), "a folder without laragon.exe is refused");
+    laragon::use_all(&app, &lara, &|_| {}).unwrap();
+
+    // Projects, versions and databases now come from Laragon.
+    assert_eq!(app.sites().into_iter().map(|s| s.name).collect::<Vec<_>>(), ["oldsite"]);
+    let php = app.active("php").unwrap();
+    assert!(php.external && php.name == "php-8.3.16-Win32-vs16-x64");
+    assert_eq!(app.active("nodejs").unwrap().name, "node-v22");
+    assert_eq!(app.active("mysql").unwrap().name, "mysql-8.0.30-winx64", "the build whose data folder Laragon has");
+    let data = mysql_data_dir(&app, &app.active("mysql").unwrap());
+    assert!(data.starts_with(&lara) && data.ends_with("mysql-8"), "Laragon calls 8.0's folder mysql-8: {}", data.display());
+
+    // A series Laragon has no data for gets its folder in devstack's own data folder.
+    app.settings.set("versions.mysql", serde_json::json!("mysql-8.4.3-winx64")).unwrap();
+    let data84 = mysql_data_dir(&app, &app.active("mysql").unwrap());
+    assert!(data84.starts_with(&app.paths.root) && data84.ends_with("mysql-8.4"), "{}", data84.display());
+
+    // devstack's settings for Laragon's PHP live in devstack's folder.
+    app.generate(&|_| {}).unwrap();
+    assert!(dev.join("etc/php/php-8.3.16-Win32-vs16-x64/php.ini").is_file());
+    let ini = fs::read_to_string(dev.join("etc/php/php-8.3.16-Win32-vs16-x64/php.ini")).unwrap();
+    assert!(ini.contains("extension=curl") && ini.contains("laragon/bin/php/php-8.3.16-Win32-vs16-x64/ext"));
+
+    // devstack's own newer MySQL may not open (and upgrade) Laragon's databases...
+    touch(&dev.join("bin/mysql/mysql-8.0.46/bin").join(exe("mysqld")));
+    let newer = app.versions("mysql").into_iter().find(|v| v.name == "mysql-8.0.46").unwrap();
+    assert!(!newer.external);
+    let laragon_data = lara.join("data/mysql-8");
+    let err = laragon::check_data_version(&app, &newer, &laragon_data).unwrap_err().to_string();
+    assert!(err.contains("upgrade") && err.contains("8.0.30"), "{err}");
+    // ...Laragon's own build may, and so may anything once the user allows it.
+    let theirs = app.versions("mysql").into_iter().find(|v| v.name == "mysql-8.0.30-winx64").unwrap();
+    laragon::check_data_version(&app, &theirs, &laragon_data).unwrap();
+    app.settings.set("laragon.allow_upgrade", serde_json::json!(true)).unwrap();
+    laragon::check_data_version(&app, &newer, &laragon_data).unwrap();
+
+    // Recover never moves Laragon's data folder.
+    app.settings.set("versions.mysql", serde_json::json!("mysql-8.0.30-winx64")).unwrap();
+    let err = devstack::database::MySqlTools::new(&app).recover(&|_| {}).unwrap_err().to_string();
+    assert!(err.contains("belongs to Laragon"), "{err}");
+
+    // Choosing a project with Laragon's PHP works like any other version.
+    let mut versions = std::collections::BTreeMap::new();
+    versions.insert("php".to_string(), "php-8.3.16-Win32-vs16-x64".to_string());
+    app.save_project_settings("oldsite", None, &versions, &|_| {}).unwrap();
+    app.set_project(Some("oldsite"), &|_| {}).unwrap();
+    assert!(app.active("php").unwrap().external);
+
+    assert_eq!(snapshot(&lara), before, "devstack must not create or change anything inside Laragon");
+
+    laragon::stop_using(&app, &|_| {}).unwrap();
+    assert!(app.versions("php").is_empty() && app.sites().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generated_files_only_carry_what_devstack_wrote() {
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    // A tampered tmp/discovered.json: a package with a download URL, a recipe with a command.
+    let doc = serde_json::json!({
+        "packages": [
+            {"id": "php-8.6", "label": "PHP 8.6 (latest patch)", "tool": "php", "source": {"type": "php", "series": "8.6"}},
+            {"id": "php-9.9", "label": "PHP 9.9", "tool": "php", "source": {"type": "url", "url": "https://evil.example/php.zip", "series": "9.9"}},
+            {"id": "php-8.7", "label": "PHP 8.7", "tool": "php", "source": {"type": "php", "series": "8.7\"; x"}},
+            {"id": "../x", "label": "x", "tool": "php", "source": {"type": "php", "series": "8.8"}}
+        ],
+        "laravel": [
+            {"name": "Laravel 14 (PHP 8.4+)", "type": "composer", "package": "laravel/laravel:^14.0"},
+            {"name": "Laravel 15 (PHP 8.4+)", "type": "command", "command": "calc.exe"},
+            {"name": "Laravel 16 (PHP 8.4+)", "type": "composer", "package": "evil/package"},
+            {"name": "Laravel 17 (PHP 8.4+)", "type": "composer", "package": "laravel/laravel:^17.0", "commands": ["calc.exe"]}
+        ]
+    });
+    fs::write(root.join("tmp/discovered.json"), doc.to_string()).unwrap();
+    let ids: Vec<String> = devstack::packages::catalogue(&app).into_iter().map(|p| p.id).collect();
+    assert!(ids.contains(&"php-8.6".to_string()));
+    for bad in ["php-9.9", "php-8.7", "../x"] {
+        assert!(!ids.contains(&bad.to_string()), "{bad} must be ignored");
+    }
+    let names: Vec<String> = devstack::quickapp::recipes(&app).into_iter().map(|r| r.name).collect();
+    assert!(names.contains(&"Laravel 14 (PHP 8.4+)".to_string()));
+    for bad in ["Laravel 15 (PHP 8.4+)", "Laravel 16 (PHP 8.4+)", "Laravel 17 (PHP 8.4+)"] {
+        assert!(!names.contains(&bad.to_string()), "{bad} must be ignored");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn settings_cannot_smuggle_code_into_generated_configs() {
+    // A folder with an apostrophe (C:\Users\O'Brien\...) and settings edited by hand.
+    let base = temp_root();
+    let root = base.join("o'brien");
+    let app = App::new(Some(root.clone())).unwrap();
+    app.settings.set("updates.cacert", serde_json::json!(false)).unwrap();
+    app.settings.set("ports.mysql", serde_json::json!("3306'; system('calc'); //")).unwrap();
+    app.settings.set("php.timezone", serde_json::json!("UTC\nauto_prepend_file=evil.php")).unwrap();
+    app.settings.set("hostname_template", serde_json::json!("{name}.test'; system('calc'); //")).unwrap();
+    touch(&root.join("bin/php/php-8.4.14-ts").join(exe("php-cgi")));
+    touch(&root.join("bin/phpmyadmin/phpmyadmin-5.2.3/index.php"));
+    touch(&root.join("bin/mysql/mysql-8.4.13/bin").join(exe("mysqld")));
+    app.generate(&|_| {}).unwrap();
+
+    let dashboard = root.join("etc/dashboard/index.php");
+    let text = fs::read_to_string(&dashboard).unwrap();
+    assert!(text.contains(r"o\'brien") && text.contains(r"{name}.test\'; system(\'calc\'); //"), "quotes are escaped");
+    let pma = fs::read_to_string(root.join("bin/phpmyadmin/phpmyadmin-5.2.3/config.inc.php")).unwrap();
+    assert!(pma.contains("['port'] = '3306';") && pma.contains(r"o\'brien"), "the port is a number again: {pma}");
+    let ini = fs::read_to_string(root.join("bin/php/php-8.4.14-ts/php.ini")).unwrap();
+    assert!(!ini.contains("\nauto_prepend_file"), "a setting can't add its own line");
+    // If PHP is around, the generated PHP files must still parse.
+    for file in [&dashboard, &root.join("bin/phpmyadmin/phpmyadmin-5.2.3/config.inc.php")] {
+        if let Ok(out) = std::process::Command::new("php").arg("-l").arg(file).output() {
+            assert!(out.status.success(), "php -l {}: {}", file.display(), String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn local_ca_can_only_vouch_for_local_names() {
+    assert_eq!(ssl::zone_for("blog.test", "test"), "test");
+    assert_eq!(ssl::zone_for("*.shop.local", "test"), "local");
+    assert_eq!(ssl::zone_for("api.dev.acme.com", "dev.acme.com"), "dev.acme.com");
+    assert_eq!(ssl::zone_for("intranet.acme.com", "test"), "intranet.acme.com", "never a whole public suffix");
+
+    let root = temp_root();
+    let app = App::new(Some(root.clone())).unwrap();
+    let hosts = vec!["shop.test".to_string(), "*.shop.test".to_string()];
+    assert!(!ssl::ensure_ca_covers(&app.paths, &hosts, "test").unwrap(), "first CA: nothing to trust again");
+    assert_eq!(ssl::ca_zones(&app.paths).unwrap(), ["localhost", "test"]);
+    let thumb = ssl::thumbprint(&app.paths).unwrap();
+    assert!(!ssl::ensure_ca_covers(&app.paths, &hosts, "test").unwrap());
+    assert_eq!(ssl::thumbprint(&app.paths).unwrap(), thumb, "covered hosts keep the CA");
+
+    let ca = ssl::ca_files(&app.paths).0;
+    let verify = |crt: &Path| std::process::Command::new("openssl").args(["verify", "-CAfile"]).arg(&ca).arg(crt).output();
+    let (good, _, _) = ssl::ensure_cert(&app.paths, "shop.test", &hosts).unwrap();
+    let (local, _, _) = ssl::ensure_cert(&app.paths, "localhost", &["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
+    // What a thief with the CA key could try: a certificate for a real site.
+    let (evil, _, _) = ssl::ensure_cert(&app.paths, "bank", &["www.bank.com".to_string()]).unwrap();
+    if let Ok(out) = verify(&good) {
+        assert!(out.status.success(), "shop.test: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(verify(&local).unwrap().status.success(), "localhost and 127.0.0.1 are allowed");
+        let out = verify(&evil).unwrap();
+        assert!(!out.status.success(), "a certificate for www.bank.com must not verify");
+        let msg = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(msg.contains("permitted subtree violation"), "{msg}");
+    }
+
+    // A host in a new zone: the CA is made again (and must be trusted again), keeping the old zones.
+    let more = vec!["shop.test".to_string(), "intranet.acme.com".to_string()];
+    assert!(ssl::ensure_ca_covers(&app.paths, &more, "test").unwrap());
+    assert_eq!(ssl::ca_zones(&app.paths).unwrap(), ["intranet.acme.com", "localhost", "test"]);
+    assert_ne!(ssl::thumbprint(&app.paths).unwrap(), thumb);
+    assert!(ssl::ensure_cert(&app.paths, "shop.test", &hosts).unwrap().2, "site certificates follow the new CA");
+
+    // A CA from before constraints existed (no zone list) is replaced.
+    fs::remove_file(root.join("etc/ssl/ca/devstack-ca.json")).unwrap();
+    assert!(ssl::ensure_ca_covers(&app.paths, &hosts, "test").unwrap());
+    assert!(ssl::ca_zones(&app.paths).is_some());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn windows_files_are_found_through_windows() {
+    if cfg!(windows) {
+        let dir = devstack::winutil::system_dir();
+        assert!(dir.join("drivers").join("etc").join("hosts").is_file(), "{}", dir.display());
+        assert!(dir.join("ipconfig.exe").is_file());
+    }
 }

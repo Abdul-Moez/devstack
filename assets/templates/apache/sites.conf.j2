@@ -2,6 +2,13 @@
 {% macro localhost() %}
     ServerName localhost
     DocumentRoot "{{ www }}"
+    # This catch-all host answers only when it is addressed as localhost, by this computer's
+    # name or by IP address. Any other name means a web page pointed a domain of its own at
+    # this computer ("DNS rebinding") so that its scripts could read your projects and
+    # phpMyAdmin through your browser.
+    <If "%{HTTP_HOST} !~ m#^(localhost{% if computer_name %}|{{ computer_name }}(\.local)?{% endif %}|[0-9.]+|\[[0-9a-f:.]+\])(:[0-9]+)?$#i">
+        Require all denied
+    </If>
     Alias /__devstack "{{ dashboard_dir }}"
 {% if phpmyadmin_dir %}
     Alias /phpmyadmin "{{ phpmyadmin_dir }}"

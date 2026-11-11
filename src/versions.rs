@@ -56,6 +56,8 @@ pub struct Version {
     pub name: String,
     pub path: PathBuf,
     pub exe: PathBuf,
+    /// Lives in another installation (Laragon): used in place, never written to.
+    pub external: bool,
 }
 
 impl Version {
@@ -91,9 +93,15 @@ pub fn list(bin: &std::path::Path, tool: &str) -> Vec<Version> {
                 name: e.file_name().to_string_lossy().into_owned(),
                 path: path.clone(),
                 exe,
+                external: false,
             })
         })
         .collect();
-    found.sort_by(|a, b| (b.key(), &b.name).cmp(&(a.key(), &a.name)));
+    sort(&mut found);
     found
+}
+
+/// Newest first.
+pub fn sort(versions: &mut [Version]) {
+    versions.sort_by(|a, b| (b.key(), &b.name).cmp(&(a.key(), &a.name)));
 }

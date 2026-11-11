@@ -3,6 +3,9 @@
 //! The `devstack` binary is the tray app + window, `ds` is the command line. Both drive
 //! [`core::App`]; nothing else talks to services directly.
 
+// The template context in configs.rs is one large json! literal.
+#![recursion_limit = "256"]
+
 pub mod assets;
 pub mod cli;
 pub mod configs;
@@ -11,6 +14,7 @@ pub mod database;
 pub mod error;
 pub mod gui;
 pub mod hosts;
+pub mod laragon;
 pub mod packages;
 pub mod paths;
 pub mod procs;

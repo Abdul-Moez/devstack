@@ -17,6 +17,8 @@ pub fn defaults() -> Value {
         "web_server": "apache",
         "ssl": true,
         "lan_access": false,
+        "laragon_dir": "",
+        "laragon": {"versions": false, "data": false, "asked": false, "allow_upgrade": false},
         "start_all_on_launch": false,
         "run_on_startup": false,
         "minimize_to_tray": true,
