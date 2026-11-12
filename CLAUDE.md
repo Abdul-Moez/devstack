@@ -69,8 +69,8 @@ helper end to end, the installer. The tray was tested on 2026-11-12 by posting i
 | `src/gui/mod.rs` | Window shell (sidebar, pages, modal dialogs), background jobs (`Jobs::spawn`, `spawn_keyed` for "Installing…" state), ticker thread (PHP pool healing, backups, update checks). `devstack.exe --page=install:php` opens on a page. |
 | `src/gui/pages.rs` | The pages: Overview, Sites, New project, Install, PHP, Databases, Tools, Logs, Settings. Draw from state cached in `GuiApp::refresh`, push `Action`s. |
 | `src/gui/theme.rs` | The look: palette, Windows fonts (Bahnschrift, Segoe UI, Consolas) and Segoe Fluent Icons, hand-painted widgets (buttons, toggle, status light, chips, segmented control). |
-| `src/gui/menu.rs` | The tray's native right-click menu model. `Action` (also used by the window) is serialized as the tray item id. |
-| `src/gui/tray.rs` | Tray icon (Windows only at runtime). Menu rebuilt when the pointer enters the icon. |
+| `src/gui/menu.rs` | The tray's right-click menu model (`Node`s carrying `Action`s). `Action` is also what the window's pages emit. |
+| `src/gui/tray.rs` | Tray icon (Windows only at runtime). The menu is built from the model when it's right-clicked and shown with `winutil::popup_menu`. |
 | `examples/make_icons.rs` | Draws the logo (three rack units with status lights) and writes `assets/icon-*.rgba`, `devstack.ico`, `logo.png`. |
 | `src/cli.rs` | `ds` commands, plus hidden `_elevated hosts <file>` and installer helper `setup`. |
 | `installer/devstack.iss` | Inno Setup script: folder choice, component downloads (`ds setup`), PATH/autostart tasks, VC++ runtime, clean uninstall. |
@@ -177,18 +177,26 @@ doesn't draw also never handles what's sent to it (Exit, Show). So:
   no WM_PAINT, eframe spins a CPU core and Exit with services running never happened
   (`winutil::hide_window` / `show_window`). `--hidden` parks on the second frame, because
   eframe shows the window after the first.
-* Tray handlers run inside tray-icon/muda callbacks: never show the window or drop/replace
-  the menu there (muda panics, "RefCell already borrowed"). `Jobs::show` queues `Msg::Show`,
-  `tray::remove` hides the icon and forgets the objects (process::exit still runs TLS
-  destructors), `refresh_menu` skips while a menu is open (`winutil::menu_open`).
+* The tray menu is a plain Win32 popup built at the right click (`winutil::popup_menu`,
+  TPM_RETURNCMD, ids 1..n), never a tray-icon/muda menu. muda numbers every item it ever
+  creates from one counter and the click comes back in WM_COMMAND, which carries 16 bits:
+  rebuilt every 2 s, the ids passed 65535 after six minutes and every tray click was then
+  dropped silently (v1.0.0; Exit "didn't work"). Dropping a muda menu inside its own click
+  handler also panics ("RefCell already borrowed").
+* Tray handlers run inside tray-icon's window procedure: never show the window there.
+  `Jobs::show` queues `Msg::Show`; `tray::remove` hides the icon and forgets the objects
+  (process::exit still runs TLS destructors).
+* Test tray changes on a process that has run for 10 minutes, not only on a fresh one.
 * winit can lose a redraw around the tray menu's modal loop (eframe then spins without
   drawing); the ticker invalidates the window when no frame ran for 3 s.
 * Exit: nothing running → leave at once from the tray handler. Otherwise the tray menu and
   tooltip say "Stopping services, then closing…" and the window only comes up if a database
   needs a force stop.
-* Testing without clicking: post the tray-icon callback message (6002 with WM_RBUTTONDOWN /
-  WM_RBUTTONUP, or WM_LBUTTONUP to show) to the process's `tray_icon_app` window, then keys
-  to the `#32768` menu window (Up + Enter = Exit; MN_GETHMENU reads the items).
+* Testing without clicking: post the tray-icon callback message (6002 with WM_RBUTTONDOWN
+  then WM_RBUTTONUP for the menu, or WM_LBUTTONUP to show) to the process's `tray_icon_app`
+  window, then keys to the `#32768` menu window (Up + Enter = Exit; MN_GETHMENU reads the
+  items). The menu opens at the real pointer with Exit under it, so a real click while a
+  test runs chooses Exit.
 
 ## Adding things
 

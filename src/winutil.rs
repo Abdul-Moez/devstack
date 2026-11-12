@@ -346,6 +346,80 @@ pub fn repaint_window(hwnd: isize) {
 #[cfg(not(windows))]
 pub fn repaint_window(_hwnd: isize) {}
 
+/// One entry of `popup_menu`.
+pub enum PopupItem {
+    /// `id` is what `popup_menu` returns when it's chosen (0 for entries that can't be).
+    Item { label: String, id: u32, checked: bool, enabled: bool },
+    Sub(String, Vec<PopupItem>),
+    Sep,
+}
+
+/// Shows a native popup menu at the pointer (the tray menu) and returns the id of the chosen
+/// item. Blocks in the menu's modal loop until it closes; call it on the UI thread.
+///
+/// TPM_RETURNCMD hands back the id directly. Without it the choice arrives as WM_COMMAND,
+/// which only carries 16 bits of the id (see gui/tray.rs for what that broke).
+#[cfg(windows)]
+pub fn popup_menu(items: &[PopupItem]) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow, TrackPopupMenu,
+        HMENU, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    unsafe fn build(items: &[PopupItem]) -> HMENU {
+        let menu = CreatePopupMenu();
+        for item in items {
+            match item {
+                PopupItem::Item { label, id, checked, enabled } => {
+                    let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 } | if *enabled { 0 } else { MF_GRAYED };
+                    // "&" would underline the next letter; these labels are plain text
+                    AppendMenuW(menu, flags, *id as usize, wide(&label.replace('&', "&&")).as_ptr());
+                }
+                PopupItem::Sub(label, kids) => {
+                    AppendMenuW(menu, MF_POPUP | MF_STRING, build(kids) as usize, wide(&label.replace('&', "&&")).as_ptr());
+                }
+                PopupItem::Sep => {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+            }
+        }
+        menu
+    }
+    thread_local! {
+        // An invisible window that owns the menu. It is made the foreground window while
+        // the menu is up, which is what makes a click anywhere else close the menu.
+        static OWNER: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+    unsafe {
+        let owner = OWNER.with(|o| {
+            if o.get() == 0 {
+                let class = wide("STATIC");
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOOLWINDOW, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 0, 0,
+                    std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                );
+                o.set(hwnd as isize);
+            }
+            o.get() as HWND
+        });
+        let menu = build(items);
+        let mut at = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut at);
+        SetForegroundWindow(owner);
+        let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RIGHTBUTTON;
+        let id = TrackPopupMenu(menu, flags, at.x, at.y, 0, owner, std::ptr::null());
+        PostMessageW(owner, WM_NULL, 0, 0); // Microsoft's advice for tray menus, so the next one closes properly too
+        DestroyMenu(menu); // and its submenus
+        (id > 0).then_some(id as u32)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn popup_menu(_items: &[PopupItem]) -> Option<u32> {
+    None
+}
+
 /// True while this thread shows a popup menu (the tray menu runs a modal loop on the UI thread).
 #[cfg(windows)]
 pub fn menu_open() -> bool {

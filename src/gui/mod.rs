@@ -74,10 +74,9 @@ impl Jobs {
     }
 
     /// Shows the window on the next frame, never right here. Called from tray handlers and
-    /// job threads: showing it synchronously inside a tray handler makes eframe paint inside
-    /// that handler, the frame rebuilds the tray menu, and muda panics dropping the menu whose
-    /// item is still being handled ("RefCell already borrowed"). Frames keep coming while the
-    /// window is in the tray (`winutil::hide_window` keeps it drawing).
+    /// job threads: showing it synchronously inside a tray handler makes eframe paint a whole
+    /// frame inside that handler (tray-icon's window procedure is still on the stack). Frames
+    /// keep coming while the window is in the tray (`winutil::hide_window` keeps it drawing).
     fn show(&self) {
         let _ = self.tx.send(Msg::Show);
         self.ctx.request_repaint();
@@ -223,6 +222,13 @@ fn open_database(app: &App) -> Result<()> {
     anyhow::bail!("Add HeidiSQL, DBeaver or phpMyAdmin from the Install page.")
 }
 
+/// Ends the process on purpose. The log line tells an Exit apart from a crash afterwards.
+fn leave(app: &App) -> ! {
+    app.log_line("devstack closed");
+    tray::remove(); // takes the icon out of the notification area now, not on hover
+    std::process::exit(0)
+}
+
 /// Called by the tray menu on the UI thread, even while the window is hidden.
 pub(crate) fn tray_action(jobs: &Jobs, action: Action) {
     // Exit with nothing to stop: leave right here, without waiting for a frame (tray events
@@ -232,8 +238,7 @@ pub(crate) fn tray_action(jobs: &Jobs, action: Action) {
     if matches!(action, Action::Exit) {
         let app = &jobs.app;
         if !(app.settings.bool("stop_all_on_exit") && app.services().iter().any(|s| s.running(app))) {
-            tray::remove();
-            std::process::exit(0);
+            leave(app);
         }
         let _ = jobs.tx.send(Msg::Action(action));
         jobs.ctx.request_repaint();
@@ -665,8 +670,7 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
     /// written as they change), so end the process directly.
     fn quit(&mut self, _ctx: &egui::Context) {
         self.exiting = true;
-        tray::remove(); // takes the icon out of the notification area now, not on hover
-        std::process::exit(0);
+        leave(&self.jobs.app);
     }
 
     fn exit(&mut self, ctx: &egui::Context) {
@@ -676,7 +680,7 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
             if std::mem::replace(&mut self.stopping_to_exit, true) {
                 return; // already on its way
             }
-            tray::set_exiting(&self.jobs);
+            tray::set_exiting();
             self.jobs.log("Stopping services, then closing…");
             self.jobs.spawn(true, false, |app, log| {
                 // closing either way: a failure here (ngrok) mustn't leave devstack half-exited
@@ -1078,7 +1082,6 @@ impl eframe::App for GuiApp {
         self.drain(ctx);
         if self.last_refresh.elapsed() > Duration::from_secs(2) {
             self.refresh();
-            tray::refresh_menu(&self.jobs);
         }
         if self.page == Page::Sites && self.hints_at.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
             self.scan_root_hints();

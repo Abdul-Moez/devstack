@@ -1,21 +1,24 @@
 //! The tray icon. Created only on Windows (on Linux the tray needs a GTK loop; the window
-//! works without it). The menu is rebuilt when the pointer enters the icon, so it always
-//! lists current sites and versions, and actions run even while the window is hidden.
+//! works without it). The menu is built when it is asked for (right click), so it always
+//! lists current sites and versions, and actions run even while the window is in the tray.
+//!
+//! The menu is a plain Win32 popup (`winutil::popup_menu`), not a tray-icon/muda menu: muda
+//! numbers every item it ever creates from one counter, and a click comes back through
+//! WM_COMMAND, which carries 16 bits. Rebuilt every 2 s, the ids passed 65535 after six
+//! minutes and from then on every click in the tray menu was dropped silently.
 
 use std::cell::RefCell;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::menu::{model, Action, Node};
 use super::Jobs;
 use crate::assets;
+use crate::winutil::{self, PopupItem};
 
 struct Tray {
     icon: TrayIcon,
-    built: Instant,
     running: Option<bool>,
     /// Exit is stopping the services: the menu and tooltip only say so.
     exiting: bool,
@@ -34,59 +37,48 @@ fn icon(running: bool) -> Option<Icon> {
     Icon::from_rgba(rgba.to_vec(), assets::TRAY_ICON_SIZE, assets::TRAY_ICON_SIZE).ok()
 }
 
-fn append(add: &dyn Fn(&dyn IsMenuItem), nodes: &[Node]) {
+/// The menu model as popup items. An item's id is its action's position in `actions` + 1.
+fn popup_items(nodes: &[Node], actions: &mut Vec<Action>) -> Vec<PopupItem> {
+    fn entry(label: &str, checked: bool, a: &Action, actions: &mut Vec<Action>) -> PopupItem {
+        actions.push(a.clone());
+        PopupItem::Item { label: label.to_string(), id: actions.len() as u32, checked, enabled: true }
+    }
+    let mut items = vec![];
     for n in nodes {
-        match n {
-            Node::Item(label, a) => add(&MenuItem::with_id(a.id(), label, true, None)),
-            Node::Disabled(label) => add(&MenuItem::new(label, false, None)),
-            Node::Check(label, checked, a) => add(&CheckMenuItem::with_id(a.id(), label, true, *checked, None)),
-            Node::Sub(label, kids) => {
-                let sub = Submenu::new(label, true);
-                append(&|i| { let _ = sub.append(i); }, kids);
-                add(&sub);
-            }
-            Node::Sep => add(&PredefinedMenuItem::separator()),
-        }
+        items.push(match n {
+            Node::Item(label, a) => entry(label, false, a, actions),
+            Node::Check(label, checked, a) => entry(label, *checked, a, actions),
+            Node::Disabled(label) => PopupItem::Item { label: label.clone(), id: 0, checked: false, enabled: false },
+            Node::Sub(label, kids) => PopupItem::Sub(label.clone(), popup_items(kids, actions)),
+            Node::Sep => PopupItem::Sep,
+        });
     }
+    items
 }
 
-fn build_menu(jobs: &Jobs, exiting: bool) -> Menu {
-    let menu = Menu::new();
+/// Right click on the icon: build the menu now, show it, run what was chosen. Blocks in the
+/// menu's modal loop (frames still run inside it), so TRAY must not stay borrowed here.
+fn show_menu(jobs: &Jobs) {
+    if winutil::menu_open() {
+        return; // a second right click while the menu is up
+    }
+    let exiting = TRAY.with(|t| t.try_borrow().ok().and_then(|g| g.as_ref().map(|tray| tray.exiting)).unwrap_or(false));
     let nodes = if exiting { vec![Node::Disabled(EXITING.into())] } else { model(&jobs.app) };
-    append(&|i| { let _ = menu.append(i); }, &nodes);
-    menu
-}
-
-/// Rebuild the menu (on the UI thread) if it's older than a second. Never while the menu is
-/// open: replacing it destroys the menu Windows is showing (a frame or an Enter event can
-/// arrive inside the menu's modal loop).
-pub fn refresh_menu(jobs: &Jobs) {
-    if crate::winutil::menu_open() {
-        return;
+    let mut actions = vec![];
+    let items = popup_items(&nodes, &mut actions);
+    let chosen = winutil::popup_menu(&items).and_then(|id| actions.into_iter().nth(id as usize - 1));
+    if let Some(action) = chosen {
+        super::tray_action(jobs, action);
     }
-    TRAY.with(|t| {
-        // try_borrow: never panic if Windows re-enters us while the menu is being replaced
-        if let Some(tray) = t.try_borrow_mut().ok().as_mut().and_then(|g| g.as_mut()) {
-            if tray.built.elapsed() > Duration::from_secs(1) {
-                tray.icon.set_menu(Some(Box::new(build_menu(jobs, tray.exiting))));
-                tray.built = Instant::now();
-            }
-        }
-    });
 }
 
 /// Exit is stopping the services (Laragon-style status): the tooltip says so and the menu
 /// shows nothing else until the process ends.
-pub fn set_exiting(jobs: &Jobs) {
-    let open = crate::winutil::menu_open();
+pub fn set_exiting() {
     TRAY.with(|t| {
         if let Some(tray) = t.try_borrow_mut().ok().as_mut().and_then(|g| g.as_mut()) {
             tray.exiting = true;
             let _ = tray.icon.set_tooltip(Some(format!("devstack: {}", EXITING.to_lowercase())));
-            if !open {
-                tray.icon.set_menu(Some(Box::new(build_menu(jobs, true))));
-                tray.built = Instant::now();
-            } // else refresh_menu swaps it once the menu is closed
         }
     });
 }
@@ -106,13 +98,12 @@ pub fn set_running(running: bool) {
 }
 
 pub fn exists() -> bool {
-    TRAY.with(|t| t.borrow().is_some())
+    TRAY.with(|t| t.try_borrow().map(|g| g.is_some()).unwrap_or(true)) // borrowed = in use = exists
 }
 
 /// Takes the icon out of the notification area, right before the process exits. The tray
-/// objects are never dropped: Exit runs inside the tray menu's click handler, and dropping
-/// the menu there panics (muda: "RefCell already borrowed"). They are forgotten rather than
-/// left in TRAY, because `process::exit` still runs this thread's thread-local destructors.
+/// objects are forgotten, not dropped and not left in TRAY: this runs inside the tray's own
+/// event handler, and `process::exit` still runs this thread's thread-local destructors.
 pub fn remove() {
     TRAY.with(|t| {
         if let Some(tray) = t.try_borrow_mut().ok().and_then(|mut g| g.take()) {
@@ -123,25 +114,17 @@ pub fn remove() {
 }
 
 pub fn create(jobs: Jobs) -> Result<()> {
+    // No menu is handed to tray-icon (see the top of this file); it only reports the clicks.
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(build_menu(&jobs, false)))
         .with_tooltip("devstack")
         .with_icon(icon(false).ok_or_else(|| anyhow::anyhow!("bad icon"))?)
-        .with_menu_on_left_click(false)
         .build()?;
-    TRAY.with(|t| *t.borrow_mut() = Some(Tray { icon: tray, built: Instant::now(), running: None, exiting: false }));
+    TRAY.with(|t| *t.borrow_mut() = Some(Tray { icon: tray, running: None, exiting: false }));
 
-    let j = jobs.clone();
-    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-        if let Some(action) = Action::from_id(&e.id.0) {
-            super::tray_action(&j, action);
-        }
-    }));
-    let j = jobs;
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| match e {
         TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-        | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => j.show(),
-        TrayIconEvent::Enter { .. } => refresh_menu(&j),
+        | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => jobs.show(),
+        TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Up, .. } => show_menu(&jobs),
         _ => {}
     }));
     Ok(())
