@@ -216,6 +216,16 @@ fn open_database(app: &App) -> Result<()> {
 
 /// Called by the tray menu on the UI thread, even while the window is hidden.
 pub(crate) fn tray_action(jobs: &Jobs, action: Action) {
+    // Exit from the tray while the window is hidden: handing it to the window waits for a
+    // frame that a hidden window may never get, so the process stayed alive. With nothing to
+    // stop, leave right here (tray events arrive on the UI thread).
+    if matches!(action, Action::Exit) {
+        let app = &jobs.app;
+        if !(app.settings.bool("stop_all_on_exit") && app.services().iter().any(|s| s.running(app))) {
+            tray::remove();
+            std::process::exit(0);
+        }
+    }
     if !background(jobs, &action) {
         jobs.show();
         let _ = jobs.tx.send(Msg::Action(action));
@@ -632,10 +642,14 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
         }
     }
 
-    fn quit(&mut self, ctx: &egui::Context) {
+    /// Leave for good. Asking eframe to close (ViewportCommand::Close) needs one more frame,
+    /// which never comes when the window is hidden or idle, so the process stayed in Task
+    /// Manager. Nothing is left to save at this point (services run detached, settings are
+    /// written as they change), so end the process directly.
+    fn quit(&mut self, _ctx: &egui::Context) {
         self.exiting = true;
-        tray::remove();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        tray::remove(); // takes the icon out of the notification area now, not on hover
+        std::process::exit(0);
     }
 
     fn exit(&mut self, ctx: &egui::Context) {

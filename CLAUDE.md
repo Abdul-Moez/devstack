@@ -155,9 +155,13 @@ helper end to end, the tray, the installer.
 * Apache loads PHP as a module (`php8apache2_4.dll`, thread-safe builds; Quick add defaults to
   `ts`). Apache gets the PHP folder on PATH so extension DLLs load. php.ini changes restart Apache.
 * Nginx uses the php-cgi pool: N processes from port 10987 (fallback 20987), healed every 2 s.
-* mod_proxy_fcgi + php-cgi for Apache was tried and rejected: with `.htaccess` rewrites Apache
-  sends a bogus `PATH_INFO`/`PATH_TRANSLATED` and php-cgi answers "No input file specified".
-  That path stays only as a fallback for NTS builds.
+* NTS builds (no Apache module, e.g. most of Laragon's) with Apache: mod_proxy_fcgi to the
+  php-cgi pool through `balancer://php`. Two Windows traps, both in httpd.conf.j2: the handler
+  needs the trailing slash (`proxy:balancer://php/`, else AH01144 and a 500 on every page),
+  and Apache sends `SCRIPT_FILENAME` as `/C:/path%20x/index.php`, which php-cgi can't open
+  ("No input file specified"), so `ProxyFCGISetEnvIf` strips the slash and unescapes it.
+  Live-tested 2026-11-11 with Laragon's PHP 8.4.1 NTS: Laravel/WordPress `.htaccess` rewrites,
+  PATH_INFO, spaces in paths, aliases (dashboard, phpMyAdmin) all work.
 
 ## Adding things
 

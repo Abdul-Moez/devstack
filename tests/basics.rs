@@ -127,6 +127,16 @@ fn configs_render_and_are_stable() {
     assert!(changed.contains("apache") && changed.contains("nginx"));
     assert!(fs::read_to_string(root.join("etc/apache/httpd.conf")).unwrap().contains("Listen 80\n"));
     assert!(fs::read_to_string(root.join("etc/nginx/sites.conf")).unwrap().contains("listen 80 default_server;"));
+
+    // A non-thread-safe build (no Apache module): php-cgi pool behind the balancer. Without
+    // the trailing slash every page was a 500 (AH01144), and php-cgi on Windows can't open
+    // the "/C:/..." SCRIPT_FILENAME Apache sends unless it is rewritten.
+    fs::remove_file(php.join("php8apache2_4.dll")).unwrap();
+    app.generate(&|_| {}).unwrap();
+    let httpd = fs::read_to_string(root.join("etc/apache/httpd.conf")).unwrap();
+    assert!(!httpd.contains("LoadModule php_module"));
+    assert!(httpd.contains(r#"SetHandler "proxy:balancer://php/""#), "balancer handler needs its trailing slash");
+    assert!(httpd.contains(r#"ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/([A-Za-z]:/.*)$#" SCRIPT_FILENAME "%{unescape:$1}""#));
     let _ = fs::remove_dir_all(root);
 }
 

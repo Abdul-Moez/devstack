@@ -70,11 +70,14 @@ PHPIniDir "{{ php_ini_dir }}"
     SetHandler application/x-httpd-php
 </FilesMatch>
 {% elif php_dir %}
-# Fallback for non-thread-safe PHP builds: the php-cgi pool behind Apache's balancer.
-# .htaccess rewrites to index.php (Laravel/WordPress pretty URLs) don't work this way;
-# install a "ts" PHP build from Quick add so Apache can load PHP as a module.
+# Non-thread-safe PHP builds have no Apache module: PHP files go to the php-cgi pool through
+# Apache's balancer. The trailing slash in the handler matters (without it mod_proxy finds no
+# handler for "balancer:" and every page is a 500).
 <IfModule proxy_fcgi_module>
     ProxyFCGIBackendType GENERIC
+    # On Windows Apache sends the script as "/C:/path%20with%20spaces/index.php", which
+    # php-cgi can't open ("No input file specified"); hand it the plain path.
+    ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/([A-Za-z]:/.*)$#" SCRIPT_FILENAME "%{unescape:$1}"
     <Proxy "balancer://php">
 {% for port in php_ports %}
         BalancerMember "fcgi://127.0.0.1:{{ port }}" timeout=300
@@ -82,7 +85,7 @@ PHPIniDir "{{ php_ini_dir }}"
     </Proxy>
     <FilesMatch "\.php$">
         <If "-f %{REQUEST_FILENAME}">
-            SetHandler "proxy:balancer://php"
+            SetHandler "proxy:balancer://php/"
         </If>
     </FilesMatch>
 </IfModule>

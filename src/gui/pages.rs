@@ -866,14 +866,6 @@ impl GuiApp {
             }
         });
         let Some(php) = &self.php else { return };
-        if self.web == "apache" && !php.thread_safe {
-            ui.label(
-                RichText::new("With Apache, this non-thread-safe build can't serve .htaccess pretty URLs (Laravel, WordPress). Switch to Nginx in Tools, or use a thread-safe build.")
-                    .size(12.5)
-                    .color(LED_WARN),
-            );
-            ui.add_space(10.0);
-        }
         let row = self.rows.iter().find(|r| r.id == "php");
         let usr = self.app().paths.usr.clone();
         theme::panel().show(ui, |ui| {
