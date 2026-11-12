@@ -287,23 +287,80 @@ pub fn remove_link(link: &Path) -> Result<()> {
 }
 
 // ------------------------------------------------------------------ window helpers
+/// Brings the window back, also from where `hide_window` parked it.
 #[cfg(windows)]
 pub fn show_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, IsIconic, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_HIDE, SW_RESTORE, SW_SHOW,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
     unsafe {
         let h = hwnd as windows_sys::Win32::Foundation::HWND;
-        ShowWindow(h, SW_SHOW);
-        ShowWindow(h, SW_RESTORE);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if ex & WS_EX_TOOLWINDOW as isize != 0 {
+            // parked: give it its taskbar button back (the taskbar only notices while hidden)
+            ShowWindow(h, SW_HIDE);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !(WS_EX_TOOLWINDOW as isize)) | WS_EX_APPWINDOW as isize);
+        }
+        // SW_RESTORE only when minimized: on an open maximized window it would un-maximize it
+        ShowWindow(h, if IsIconic(h) != 0 { SW_RESTORE } else { SW_SHOW });
         SetForegroundWindow(h);
     }
 }
 
+/// "Hide to the tray". Not SW_HIDE: a hidden window gets no WM_PAINT, so eframe stops
+/// drawing frames. It then spins a CPU core asking for redraws, and anything handed to the
+/// window waits forever (Exit from the tray with services running never happened). The
+/// window is parked instead as a minimized tool window off-screen: no taskbar button, not in
+/// Alt+Tab, still drawing about once a second. winit leaves the styles of a minimized window
+/// alone, and `show_window` puts them back.
 #[cfg(windows)]
 pub fn hide_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        SW_HIDE, SW_SHOWMINNOACTIVE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
     unsafe {
-        ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_HIDE);
+        let h = hwnd as windows_sys::Win32::Foundation::HWND;
+        ShowWindow(h, SW_HIDE); // the taskbar only notices a style change while the window is hidden
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize));
+        ShowWindow(h, SW_SHOWMINNOACTIVE);
+        // a minimized tool window sits above the taskbar; move it to where minimized windows go
+        SetWindowPos(h, std::ptr::null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
+}
+
+/// Makes Windows send the window a real WM_PAINT. eframe draws only when winit turns a
+/// WM_PAINT into RedrawRequested; winit asks for one with RDW_INTERNALPAINT, and that request
+/// can get lost around the tray menu's modal loop. eframe then spins a CPU core waiting for
+/// it and draws nothing until the window is invalidated. Safe from any thread.
+#[cfg(windows)]
+pub fn repaint_window(hwnd: isize) {
+    use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_INTERNALPAINT, RDW_INVALIDATE};
+    unsafe {
+        RedrawWindow(hwnd as windows_sys::Win32::Foundation::HWND, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_INTERNALPAINT);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn repaint_window(_hwnd: isize) {}
+
+/// True while this thread shows a popup menu (the tray menu runs a modal loop on the UI thread).
+#[cfg(windows)]
+pub fn menu_open() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE};
+    unsafe {
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        GetGUIThreadInfo(GetCurrentThreadId(), &mut info) != 0 && info.flags & (GUI_POPUPMENUMODE | GUI_INMENUMODE) != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn menu_open() -> bool {
+    false
 }
 
 #[cfg(not(windows))]

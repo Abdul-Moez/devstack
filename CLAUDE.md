@@ -19,7 +19,8 @@ on ports 18080/18443 in dev-root: Apache with PHP as a module, Nginx with the ph
 switching between them while running, HTTPS with the name-constrained CA (OpenSSL and
 Schannel accept it), a project web folder, dotfile blocking, the host-name guard, stop.
 Still untested: MySQL/MariaDB and the other databases actually starting, the UAC hosts
-helper end to end, the tray, the installer.
+helper end to end, the installer. The tray was tested on 2026-11-12 by posting its messages
+(see "The window and the tray"); real clicks and a database force-stop during Exit weren't.
 
 1. Toolchain: `winget install Rustlang.Rustup` and the MSVC build tools
    (`winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`).
@@ -165,6 +166,29 @@ helper end to end, the tray, the installer.
   ("No input file specified"), so `ProxyFCGISetEnvIf` strips the slash and unescapes it.
   Live-tested 2026-11-11 with Laragon's PHP 8.4.1 NTS: Laravel/WordPress `.htaccess` rewrites,
   PATH_INFO, spaces in paths, aliases (dashboard, phpMyAdmin) all work.
+
+## The window and the tray (why it's done this way)
+
+eframe draws only when winit turns a WM_PAINT into RedrawRequested, and a window that
+doesn't draw also never handles what's sent to it (Exit, Show). So:
+
+* "Hide to the tray" parks the window as a minimized tool window at -32000 (no taskbar
+  button, not in Alt+Tab, still drawing once a second), never SW_HIDE: a hidden window gets
+  no WM_PAINT, eframe spins a CPU core and Exit with services running never happened
+  (`winutil::hide_window` / `show_window`). `--hidden` parks on the second frame, because
+  eframe shows the window after the first.
+* Tray handlers run inside tray-icon/muda callbacks: never show the window or drop/replace
+  the menu there (muda panics, "RefCell already borrowed"). `Jobs::show` queues `Msg::Show`,
+  `tray::remove` hides the icon and forgets the objects (process::exit still runs TLS
+  destructors), `refresh_menu` skips while a menu is open (`winutil::menu_open`).
+* winit can lose a redraw around the tray menu's modal loop (eframe then spins without
+  drawing); the ticker invalidates the window when no frame ran for 3 s.
+* Exit: nothing running → leave at once from the tray handler. Otherwise the tray menu and
+  tooltip say "Stopping services, then closing…" and the window only comes up if a database
+  needs a force stop.
+* Testing without clicking: post the tray-icon callback message (6002 with WM_RBUTTONDOWN /
+  WM_RBUTTONUP, or WM_LBUTTONUP to show) to the process's `tray_icon_app` window, then keys
+  to the `#32768` menu window (Up + Enter = Exit; MN_GETHMENU reads the items).
 
 ## Adding things
 

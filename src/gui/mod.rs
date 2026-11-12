@@ -48,6 +48,8 @@ pub enum Msg {
     Action(Action),
     /// Projects whose index file sits in a subfolder: project name -> that folder.
     RootHints(HashMap<String, String>),
+    /// Bring the window back (see `Jobs::show`).
+    Show,
 }
 
 /// Shared by the window, the tray handlers and the ticker thread.
@@ -60,6 +62,8 @@ pub struct Jobs {
     /// Keys of jobs in progress that the window shows as such ("quickadd:<id>", "quickapp").
     pending: Arc<Mutex<HashSet<String>>>,
     pub hwnd: Arc<AtomicIsize>,
+    /// When the window last ran a frame (it asks for one every second; see `start_ticker`).
+    last_frame: Arc<Mutex<Instant>>,
 }
 
 impl Jobs {
@@ -69,8 +73,13 @@ impl Jobs {
         self.ctx.request_repaint();
     }
 
+    /// Shows the window on the next frame, never right here. Called from tray handlers and
+    /// job threads: showing it synchronously inside a tray handler makes eframe paint inside
+    /// that handler, the frame rebuilds the tray menu, and muda panics dropping the menu whose
+    /// item is still being handled ("RefCell already borrowed"). Frames keep coming while the
+    /// window is in the tray (`winutil::hide_window` keeps it drawing).
     fn show(&self) {
-        winutil::show_window(self.hwnd.load(Ordering::SeqCst));
+        let _ = self.tx.send(Msg::Show);
         self.ctx.request_repaint();
     }
 
@@ -216,15 +225,19 @@ fn open_database(app: &App) -> Result<()> {
 
 /// Called by the tray menu on the UI thread, even while the window is hidden.
 pub(crate) fn tray_action(jobs: &Jobs, action: Action) {
-    // Exit from the tray while the window is hidden: handing it to the window waits for a
-    // frame that a hidden window may never get, so the process stayed alive. With nothing to
-    // stop, leave right here (tray events arrive on the UI thread).
+    // Exit with nothing to stop: leave right here, without waiting for a frame (tray events
+    // arrive on the UI thread; tray::remove only hides the icon, it drops nothing). Otherwise
+    // the window stops the services without showing itself (the tray tells), and only comes
+    // up if a database has to be force-stopped.
     if matches!(action, Action::Exit) {
         let app = &jobs.app;
         if !(app.settings.bool("stop_all_on_exit") && app.services().iter().any(|s| s.running(app))) {
             tray::remove();
             std::process::exit(0);
         }
+        let _ = jobs.tx.send(Msg::Action(action));
+        jobs.ctx.request_repaint();
+        return;
     }
     if !background(jobs, &action) {
         jobs.show();
@@ -390,6 +403,8 @@ pub struct GuiApp {
     start_hidden: bool,
     first_frame: bool,
     exiting: bool,
+    /// Exit is stopping the services; quits when they're down.
+    stopping_to_exit: bool,
     tray_hint_shown: bool,
     // overlays and page state
     dialog: Option<Dialog>,
@@ -422,6 +437,7 @@ impl GuiApp {
             busy: Arc::new(AtomicUsize::new(0)),
             pending: Arc::new(Mutex::new(HashSet::new())),
             hwnd,
+            last_frame: Arc::new(Mutex::new(Instant::now())),
         };
         if cfg!(windows) {
             if let Err(e) = tray::create(jobs.clone()) {
@@ -462,6 +478,7 @@ impl GuiApp {
             start_hidden,
             first_frame: true,
             exiting: false,
+            stopping_to_exit: false,
             tray_hint_shown: false,
             dialog: None,
             share: None,
@@ -656,8 +673,19 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
         let app = self.app();
         let anything = app.services().iter().any(|s| s.running(app));
         if app.settings.bool("stop_all_on_exit") && anything {
-            self.jobs.log("Stopping services before exit…");
-            self.jobs.spawn(true, false, |app, log| Ok(Outcome::StopPending(app.stop_all(log, false)?, true)));
+            if std::mem::replace(&mut self.stopping_to_exit, true) {
+                return; // already on its way
+            }
+            tray::set_exiting(&self.jobs);
+            self.jobs.log("Stopping services, then closing…");
+            self.jobs.spawn(true, false, |app, log| {
+                // closing either way: a failure here (ngrok) mustn't leave devstack half-exited
+                let pending = app.stop_all(log, false).unwrap_or_else(|e| {
+                    log(&format!("ERROR: {e:#}"));
+                    vec![]
+                });
+                Ok(Outcome::StopPending(pending, true))
+            });
         } else {
             self.quit(ctx);
         }
@@ -669,6 +697,7 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
                 Msg::Log(m) => self.push_log(m),
                 Msg::Action(a) => self.dispatch(ctx, a),
                 Msg::RootHints(hints) => self.root_hints = hints,
+                Msg::Show => winutil::show_window(self.jobs.hwnd.load(Ordering::SeqCst)),
                 Msg::Done { quiet, result } => {
                     self.refresh();
                     self.hints_at = None; // something changed: look again
@@ -833,9 +862,15 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
     fn confirm_done(&mut self, then: ConfirmThen) {
         match then {
             ConfirmThen::ForceStop(sid) => self.jobs.spawn(true, false, move |app, log| app.stop(&sid, log, true).map(|_| Outcome::Nothing)),
-            ConfirmThen::ForceStopAll { then_exit } => {
-                self.jobs.spawn(true, false, move |app, log| Ok(Outcome::StopPending({ app.stop_all(log, true)?; vec![] }, then_exit)))
-            }
+            ConfirmThen::ForceStopAll { then_exit } => self.jobs.spawn(true, false, move |app, log| {
+                if let Err(e) = app.stop_all(log, true) {
+                    if !then_exit {
+                        return Err(e);
+                    }
+                    log(&format!("ERROR: {e:#}")); // closing anyway, as asked
+                }
+                Ok(Outcome::StopPending(vec![], then_exit))
+            }),
             ConfirmThen::Recover => self.jobs.spawn(true, false, |app, log| Ok(Outcome::Recovered(database::MySqlTools::new(app).recover(log)?))),
             ConfirmThen::Restore(p) => self.jobs.spawn(true, false, move |app, log| database::MySqlTools::new(app).restore(&p, log).map(|_| Outcome::Nothing)),
             ConfirmThen::UseLaragon(p) => self.jobs.spawn(true, false, move |app, log| crate::laragon::use_all(app, &p, log).map(|_| Outcome::Nothing)),
@@ -1031,11 +1066,14 @@ They're used in place; devstack doesn't change Laragon's folders. Don't run Lara
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        *self.jobs.last_frame.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         if self.first_frame {
             self.first_frame = false;
-            if self.start_hidden && tray::exists() {
-                self.hide(ctx);
+            if self.start_hidden {
+                ctx.request_repaint(); // eframe shows the window after the first frame; hide on the next
             }
+        } else if std::mem::take(&mut self.start_hidden) && tray::exists() {
+            self.hide(ctx);
         }
         self.drain(ctx);
         if self.last_refresh.elapsed() > Duration::from_secs(2) {
@@ -1108,14 +1146,21 @@ fn qr_texture(ctx: &egui::Context, url: &str) -> egui::TextureHandle {
     ctx.load_texture("share-qr", egui::ColorImage::from_rgba_unmultiplied([size, size], &pixels), egui::TextureOptions::NEAREST)
 }
 
-/// Every 2 s: heal the PHP pool. Every 10 min: scheduled backups and daily update checks.
-/// Runs on its own thread so it works while the window is hidden.
+/// Every 2 s: heal the PHP pool, and get the window drawing again if it stopped. Every 10 min:
+/// scheduled backups and daily update checks. Runs on its own thread so it works while the
+/// window is in the tray.
 fn start_ticker(jobs: Jobs) {
     std::thread::spawn(move || {
         let mut ticks: u64 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(2));
             ticks += 1;
+            // The window asks for a frame every second. None for 3 s means eframe lost its
+            // redraw (winutil::repaint_window) and spins without drawing; anything handed to
+            // the window (Exit, Show) would wait forever.
+            if jobs.last_frame.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(3) {
+                winutil::repaint_window(jobs.hwnd.load(Ordering::SeqCst));
+            }
             let app = &jobs.app;
             if let Some(_g) = app.try_lock() {
                 let log = |m: &str| jobs.log(m);
