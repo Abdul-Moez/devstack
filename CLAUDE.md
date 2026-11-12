@@ -42,6 +42,9 @@ helper end to end, the tray, the installer.
    Bump the versions in `assets/packages.json` when MySQL releases.
 7. `scripts\build-installer.ps1` → `dist\devstack-setup-<version>.exe`. Test it in Windows
    Sandbox: install to C:\devstack with the Recommended set, run, uninstall.
+   Releases come from GitHub Actions (`.github/workflows/build.yml`): pushing the tag
+   `v<version in Cargo.toml>` publishes the installer, a portable zip and SHA256SUMS.txt; a
+   tag that doesn't match Cargo.toml fails the build.
 
 ## Map
 

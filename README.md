@@ -146,7 +146,12 @@ Open the folder in VS Code (recommended extensions: rust-analyzer). Then:
 * `scripts\build-installer.ps1`: release build + `dist\devstack-setup-<version>.exe`
   (installs Inno Setup with winget if needed)
 
-Or push to GitHub: `.github/workflows/build.yml` builds the installer and offers it under the
-Actions tab (and attaches it to a Release when you push a `v*` tag).
+Or push to GitHub: `.github/workflows/build.yml` builds the installer and a portable zip and
+offers them under the Actions tab.
+
+To publish a release: set `version` in `Cargo.toml`, commit and push, then push the matching
+tag (`git tag -a v1.0.0 -m "devstack 1.0.0"`, `git push origin v1.0.0`). The workflow checks
+that the tag matches `Cargo.toml` and publishes a GitHub Release with the installer, the
+portable zip and `SHA256SUMS.txt`.
 
 `CLAUDE.md` describes the architecture and the remaining Windows checks for Claude Code.

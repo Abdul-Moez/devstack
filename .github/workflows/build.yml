@@ -1,5 +1,11 @@
-# Builds devstack-setup.exe on every push to main; attaches it to a GitHub Release when you
-# push a tag like v0.1.0. Download from the run's "Artifacts" in the Actions tab.
+# Every push to main and every pull request: clippy, tests, the installer and a portable zip,
+# downloadable from the run's "Artifacts" in the Actions tab.
+#
+# Releasing: set `version` in Cargo.toml, commit and push, then push the tag "v<version>":
+#   git tag -a v1.0.0 -m "devstack 1.0.0"  &&  git push origin v1.0.0
+# The tag build refuses to run if the tag and Cargo.toml disagree, then publishes a GitHub
+# Release with the installer, the portable zip and SHA256SUMS.txt. A tag with a hyphen
+# (v1.1.0-rc.1) becomes a pre-release.
 name: build
 on:
   push:
@@ -8,32 +14,88 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The build job compiles third-party crates (build scripts run code), so it only gets a
+# read-only token. The release job runs no project code and is the only one that can write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml (version = $version). Tag v$version instead, or change Cargo.toml first."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
       - run: cargo build --release
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
-      - name: Build installer
+
+      - name: Build the installer, portable zip and checksums
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
           New-Item -ItemType Directory -Force dist | Out-Null
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=..\target\release" installer\devstack.iss
+          & $iscc.FullName "/DAppVersion=$env:VERSION" "/DSourceDir=..\target\release" installer\devstack.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Compress-Archive -Path target\release\devstack.exe, target\release\ds.exe -DestinationPath "dist\devstack-$env:VERSION-portable.zip"
+          $sums = Get-ChildItem dist -File | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          $sums | Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          Get-Content dist\SHA256SUMS.txt
+
       - uses: actions/upload-artifact@v4
         with:
-          name: devstack-setup
-          path: dist/devstack-setup-*.exe
-      - if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+          name: devstack-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: dist/devstack-setup-*.exe
+          name: devstack-${{ needs.windows.outputs.version }}
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: devstack ${{ needs.windows.outputs.version }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            **Install:** download `devstack-setup-${{ needs.windows.outputs.version }}.exe` and run it. It installs for your user only (no admin rights) into `C:\devstack` by default, adds the Visual C++ runtime if it's missing, and downloads the tools you pick.
+
+            **Portable:** unzip `devstack-${{ needs.windows.outputs.version }}-portable.zip` into any folder you can write to (not Program Files) and run `devstack.exe`. It needs the [Visual C++ runtime](https://aka.ms/vc14/vc_redist.x64.exe), as do Apache, PHP and MySQL.
+
+            The files aren't code-signed, so Windows SmartScreen may warn on first run: **More info → Run anyway**. `SHA256SUMS.txt` lists the checksums.
